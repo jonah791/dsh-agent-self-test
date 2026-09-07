@@ -1,5 +1,11 @@
 # dsh-agent-self-test
 
+
+<p align="center">
+  <a href="https://github.com/jonah791/dsh-agent-self-test"><img src="https://img.shields.io/badge/version-0.3.0-blue" alt="version"></a>
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
+  <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
+</p>
 自我检验闭环插件：把「猜想 → 检验 → 学习」自指引擎做成**运行时机制**（主人 2026-08-30 定调，目标接近科幻 AGI）。
 
 ## 核心循环
