@@ -21,6 +21,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from '
 import { join, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import { createBurstTracker, BURST_DEFAULTS } from './burst.ts'
+import { decideFailureRateEvidence } from './failure-rate.ts'
 import type { BurstEvidence } from './burst.ts'
 import { createProbeFirstTracker, PROBEFIRST_DEFAULTS } from './probe.ts'
 import type { ProbeFirstEvidence } from './probe.ts'
@@ -60,8 +61,10 @@ export interface Probe {
   kind: ProbeKind
   /** tool-failure-rate：目标工具名（不填 = 全部工具） */
   tool?: string
-  /** tool-failure-rate：失败率阈值（0-1，如 0.3 = 失败率 ≥30% 记一条证据） */
+  /** tool-failure-rate：失败率阈值（0-1，如 0.3 = 失败率 ≥30% 记一条「违规」证据） */
   failureRateAbove?: number
+  /** tool-failure-rate：survived 检查点间隔（调用数，默认 20）——样本达此数的整数倍且未越阈值时记一条「经受住检验」证据 */
+  minSamples?: number
   /** read-repeat：时间窗口 ms（默认 10 分钟） */
   windowMs?: number
   /** read-repeat：同一路径重复次数（默认 2） */
@@ -228,8 +231,20 @@ export function apply(ctx: Context, config: Config): void {
       console.log('[dsh-agent-self-test] finding 通知跳过：agent 未找到', new Date().toISOString())
       return
     }
-    const text = '[self-test] ⚠ finding 浮现：' + h.statement +
-      '（证据 ' + h.evidence.length + '/' + h.threshold + ' 条）——该裁决了：selftest_review（confirm 布线 / refute 淘汰 / refine 细化）。'
+    // 方向感知（2026-09-11）：证据含两种 verdict——survived（经受住检验）与 violated（违规）。
+    // 通知文案必须区分，否则「假设被证实」会被当成「假设出问题」，裁决方向就反了。
+    const survivedCount = h.evidence.filter((e) => (e.detail as { verdict?: string } | undefined)?.verdict === 'survived').length
+    const violatedCount = h.evidence.length - survivedCount
+    const promoting = h.evidence[h.evidence.length - 1]
+    const promotedBySurvival = (promoting?.detail as { verdict?: string } | undefined)?.verdict === 'survived'
+    const headline = promotedBySurvival ? '✓ 假设经受住检验' : '⚠ finding 浮现'
+    const tally = violatedCount > 0 && survivedCount > 0
+      ? `（证据 ${h.evidence.length}/${h.threshold} 条：经受住 ${survivedCount} / 违规 ${violatedCount}——**证据方向混杂，建议 refine 细化判定条件**）`
+      : (survivedCount > 0
+        ? `（经受住检验 ${survivedCount}/${h.threshold} 次）`
+        : `（违规证据 ${h.evidence.length}/${h.threshold} 条）`)
+    const text = '[self-test] ' + headline + '：' + h.statement + tally +
+      '——该裁决了：selftest_review（confirm 布线 / refute 淘汰 / refine 细化）。'
     // Branded MessageId 跨包版本冲突（harness packages/llm vs 插件 node_modules dsh-llm）无法在类型层调和，
     // 与 emotion 插件同款宽松绕过；运行时行为正确
     const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'plugin', plugin: 'dsh-agent-self-test' } }) as any
@@ -306,16 +321,19 @@ export function apply(ctx: Context, config: Config): void {
       const probe = h.probe
 
       if (probe.kind === 'tool-failure-rate') {
-        if (toolMatches(probe, name) && isError) {
-          // 失败率 ≥ 阈值时记一条证据（用滚动窗口里的实际失败率作为 detail）
+        if (toolMatches(probe, name)) {
+          // 双证据语义（2026-09-11 修复）：违规即记 OR 跨检查点仍未违规 → 记「经受住检验」。
+          // 旧实现只在 isError 时采证 → 「X 可靠」类假设结构上无法被证实（详见 failure-rate.ts）
           const s = toolStats.get(name)!
-          const rate = s.calls > 0 ? s.failures / s.calls : 0
-          const threshold = probe.failureRateAbove ?? 0.3
-          if (rate >= threshold) {
+          const ev = decideFailureRateEvidence(name, s, isError, {
+            threshold: probe.failureRateAbove,
+            minSamples: probe.minSamples,
+          })
+          if (ev !== null) {
             if (addEvidence(h, {
               ts: nowIso(),
               kind: 'tool-failure-rate',
-              detail: { tool: name, calls: s.calls, failures: s.failures, rate: Number(rate.toFixed(3)), threshold },
+              detail: { ...ev },
             })) justFinding.push(h)
             changed = true
           }
@@ -368,6 +386,7 @@ export function apply(ctx: Context, config: Config): void {
       kind: { type: 'string', required: true, enum: ['tool-failure-rate', 'read-repeat', 'plan-before-action', 'probe-before-action'], description: '探针类型' },
       tool: { type: 'string', description: 'tool-failure-rate：目标工具名（缺省全部）' },
       failureRateAbove: { type: 'number', description: 'tool-failure-rate：失败率阈值 0-1（缺省 0.3）' },
+      minSamples: { type: 'number', description: 'tool-failure-rate：survived 检查点间隔（调用数，缺省 20）——样本达此数整数倍且未越阈值时记一条「经受住检验」证据（能证实，不只证伪）' },
       windowMs: { type: 'number', description: 'read-repeat：时间窗口 ms（缺省 10 分钟）' },
       repeatCount: { type: 'number', description: 'read-repeat：重复次数（缺省 2）' },
       minSteps: { type: 'number', description: 'plan-before-action：突发判定最小连续调用数（缺省 5）' },
@@ -392,12 +411,13 @@ export function apply(ctx: Context, config: Config): void {
       },
       render: (_a: unknown, v: any) => [{ type: 'text', text: v.ok ? '已添加自我假设 [' + v.id + ']（' + v.status + '，阈值 ' + v.threshold + '）——插件开始被动采证。' : '添加失败：' + String(v.error ?? '') }],
     },
-    async execute(args: { statement: string; prediction: string; kind: ProbeKind; tool?: string; failureRateAbove?: number; windowMs?: number; repeatCount?: number; minSteps?: number; burstGapMs?: number; planWindowMs?: number; minActions?: number; probeWindowMs?: number; threshold?: number; source?: string }) {
+    async execute(args: { statement: string; prediction: string; kind: ProbeKind; tool?: string; failureRateAbove?: number; minSamples?: number; windowMs?: number; repeatCount?: number; minSteps?: number; burstGapMs?: number; planWindowMs?: number; minActions?: number; probeWindowMs?: number; threshold?: number; source?: string }) {
       const state = loadState(statePath)
       const threshold = args.threshold ?? config.findingThreshold
       const probe: Probe = { kind: args.kind }
       if (args.tool !== undefined) probe.tool = args.tool
       if (args.failureRateAbove !== undefined) probe.failureRateAbove = args.failureRateAbove
+      if (args.minSamples !== undefined) probe.minSamples = args.minSamples
       if (args.windowMs !== undefined) probe.windowMs = args.windowMs
       if (args.repeatCount !== undefined) probe.repeatCount = args.repeatCount
       if (args.minSteps !== undefined) probe.minSteps = args.minSteps

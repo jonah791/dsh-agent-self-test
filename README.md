@@ -35,9 +35,12 @@ selftest_add（可证伪假设）
 
 | kind | 观测 | 典型假设 |
 |------|------|---------|
-| `tool-failure-rate` | 某工具（或全部）失败率 ≥ 阈值记证据 | 「工具 X 不可靠（失败率 ≥30%）」 |
+| `tool-failure-rate` | **双向**：① 失败率 ≥ 阈值记 `violated` 证据；② 调用数达检查点（`minSamples` 整数倍）且失败率 < 阈值记 `survived`（经受住检验）证据 | 「工具 X 不可靠（失败率 ≥30%）」 |
 | `read-repeat` | 同一路径在窗口内重复读取 ≥ N 次记证据 | 「我倾向于重复读同一文件（健忘信号）」 |
 | `plan-before-action` | 连续工具调用突发（间隔<60s、长度≥5）前 3 分钟无 todo_write 规划 + 突发内失败 ≥1 记证据 | 「复杂多步任务不先规划会更多返工」 |
+| `probe-before-action` | 实施突发（mutating ≥3）首个动作前 15 分钟无证伪探测 + 突发内失败 ≥1 记证据 | 「驱动方案前会先做最小证伪实验」（5.9 传感器） |
+
+**tool-failure-rate 的双向语义（2026-09-11 修复）**：早期实现只在 `isError` 时采证 → 「X 可靠」这类假设**结构上无法被证实**，永远停在 active 并污染感知圈报告（实测 2 条假设证据恒 0）。现在两种证据都会采（`detail.verdict` 区分 `violated` / `survived`），finding 通知也按方向给不同文案——「假设经受住检验」与「finding 浮现」是相反的行动信号。纯判定逻辑在 `src/failure-rate.ts`（无 IO/时间依赖），离线单测 `tests/failure-rate.test.mjs`。
 
 突发推进每工具调用只做一次（多假设不 double-count），证据广播给所有 active 的 plan-before-action 假设。
 
