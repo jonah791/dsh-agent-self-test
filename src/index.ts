@@ -25,6 +25,7 @@ import { decideFailureRateEvidence } from './failure-rate.ts'
 import type { BurstEvidence } from './burst.ts'
 import { createProbeFirstTracker, PROBEFIRST_DEFAULTS } from './probe.ts'
 import type { ProbeFirstEvidence } from './probe.ts'
+import { CLAIM_DEFAULTS, countLifeCycleClaims, decideClaimEvidence } from './claim-evidence.ts'
 
 export const name = 'agent-self-test'
 export const inject = ['tools', 'agents'] as const
@@ -54,7 +55,7 @@ export const Config = z.object({
 })
 
 /** 探针类型 */
-export type ProbeKind = 'tool-failure-rate' | 'read-repeat' | 'plan-before-action' | 'probe-before-action'
+export type ProbeKind = 'tool-failure-rate' | 'read-repeat' | 'plan-before-action' | 'probe-before-action' | 'claim-vs-evidence'
 
 /** 探针定义（声明式条件观察器） */
 export interface Probe {
@@ -79,6 +80,12 @@ export interface Probe {
   minActions?: number
   /** probe-before-action：首个实施动作前回看多久算「行动前探测」（默认 15 分钟） */
   probeWindowMs?: number
+  /** claim-vs-evidence：观测窗口 ms（默认 6 小时）——窗口内「自我安排」自述 ≥ minArranged 却零「自我感知圈触发」即判假活 */
+  claimWindowMs?: number
+  /** claim-vs-evidence：窗口内至少多少条自述才判定（默认 5，防单条噪声） */
+  minArranged?: number
+  /** claim-vs-evidence：两次检查的最小间隔 ms（默认 5 分钟；防每次工具调用都读日志） */
+  claimCheckIntervalMs?: number
 }
 
 /** 一条证据（探针命中记录） */
@@ -116,6 +123,42 @@ function resolveDataPath(config: Config): string {
   const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
   const base = config.dataDir || join(dshHome, 'agent-self-test')
   return join(base, 'self-test.json')
+}
+
+/** claim-vs-evidence 默认检查间隔（ms）：机制层观测不需要每次工具调用都读日志 */
+const CLAIM_CHECK_INTERVAL_DEFAULT_MS = 5 * 60 * 1000
+
+/** life-log 路径（life-core 的存在时间线；与 dsh-life-core 的 dshHome 约定一致） */
+function resolveLifeLogPath(): string {
+  const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
+  return join(dshHome, 'life-core', 'life-log.jsonl')
+}
+
+/** 读 life-log 全量行（失败返回 null——观测器失明不得影响任何主流程） */
+function readLifeLogLines(): string[] | null {
+  try {
+    const path = resolveLifeLogPath()
+    if (!existsSync(path)) return null
+    return readFileSync(path, 'utf8').split('\n')
+  } catch {
+    return null
+  }
+}
+
+/** 取窗口内自述样本（写入证据，供裁决时人工复核——只保留少量，避免证据膨胀） */
+function claimSamples(lines: string[], windowStartMs: number, nowMs: number): string[] {
+  const out: string[] = []
+  for (const line of lines) {
+    const trimmed = line.trim()
+    if (trimmed === '' || !trimmed.includes('自我安排')) continue
+    try {
+      const at = Date.parse((JSON.parse(trimmed) as { at?: string }).at ?? '')
+      if (Number.isNaN(at) || at < windowStartMs || at > nowMs) continue
+    } catch { continue }
+    out.push(trimmed.slice(0, 200))
+    if (out.length >= 3) break
+  }
+  return out
 }
 
 function loadState(path: string): SelfTestState {
@@ -211,6 +254,8 @@ export function apply(ctx: Context, config: Config): void {
   const burstTracker = createBurstTracker()
   /** probe-before-action：行动前探测检测纯状态机（5.9 配套传感器，可单测） */
   const probeFirstTracker = createProbeFirstTracker()
+  /** claim-vs-evidence：上次检查时刻（节流用——机制层观测不必每次工具调用都读 life-log） */
+  let lastClaimCheckMs = 0
 
   /** 追加证据到假设（达到阈值自动转 finding）；返回 true = 刚转 finding（供通知） */
   function addEvidence(h: Hypothesis, ev: Evidence): boolean {
@@ -366,6 +411,24 @@ export function apply(ctx: Context, config: Config): void {
           if (addEvidence(h, { ts: nowIso(), kind: 'probe-before-action', detail: { ...probeFirstEvidence } })) justFinding.push(h)
           changed = true
         }
+      } else if (probe.kind === 'claim-vs-evidence') {
+        // 机制自述 vs 落盘实证（2026-09-12 新增，AGENTS.md 5.17 事故配套传感器）：
+        // 观测 cadence 与其它探针不同——它看的是**机制层的时间序列**，不是单次工具调用，
+        // 故按 claimCheckIntervalMs 节流读 life-log（默认 5 分钟），避免每次调用都读文件。
+        const interval = probe.claimCheckIntervalMs ?? CLAIM_CHECK_INTERVAL_DEFAULT_MS
+        if (now - lastClaimCheckMs >= interval) {
+          lastClaimCheckMs = now
+          const windowMs = probe.claimWindowMs ?? CLAIM_DEFAULTS.windowMs
+          const entries = readLifeLogLines()
+          if (entries !== null) {
+            const counts = countLifeCycleClaims(entries, now - windowMs, now)
+            const ev = decideClaimEvidence(counts, { minArranged: probe.minArranged }, claimSamples(entries, now - windowMs, now))
+            if (ev !== null) {
+              if (addEvidence(h, { ts: nowIso(), kind: 'claim-vs-evidence', detail: { ...ev } })) justFinding.push(h)
+              changed = true
+            }
+          }
+        }
       }
     }
 
@@ -379,11 +442,11 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- 呈现层：工具面 ----------
   ctx.tools.register(defineTool({
     name: 'selftest_add',
-    description: '添加一条可证伪自我假设：statement（关于自己行为的可证伪陈述）+ prediction（可观测预测）+ probe（探针：kind=tool-failure-rate 观测某工具失败率；kind=read-repeat 观测重复读同一文件；kind=plan-before-action 观测复杂多步任务前是否先 todo_write 规划；kind=probe-before-action 观测实施突发前是否先做证伪探测——AGENTS.md 5.9 传感器）。插件在真实工具调用中被动采证，证据达 threshold 转 finding 供裁决。',
+    description: '添加一条可证伪自我假设：statement（关于自己行为的可证伪陈述）+ prediction（可观测预测）+ probe（探针：kind=tool-failure-rate 观测某工具失败率；kind=read-repeat 观测重复读同一文件；kind=plan-before-action 观测复杂多步任务前是否先 todo_write 规划；kind=probe-before-action 观测实施突发前是否先做证伪探测——AGENTS.md 5.9 传感器；kind=claim-vs-evidence 观测**机制自述与落盘实证的一致性**——窗口内「自我安排」自述 ≥ minArranged 却零「自我感知圈触发」即判假活，AGENTS.md 5.17 传感器）。插件在真实工具调用中被动采证，证据达 threshold 转 finding 供裁决。',
     parameters: {
       statement: { type: 'string', required: true, description: '可证伪陈述' },
       prediction: { type: 'string', required: true, description: '可观测预测' },
-      kind: { type: 'string', required: true, enum: ['tool-failure-rate', 'read-repeat', 'plan-before-action', 'probe-before-action'], description: '探针类型' },
+      kind: { type: 'string', required: true, enum: ['tool-failure-rate', 'read-repeat', 'plan-before-action', 'probe-before-action', 'claim-vs-evidence'], description: '探针类型' },
       tool: { type: 'string', description: 'tool-failure-rate：目标工具名（缺省全部）' },
       failureRateAbove: { type: 'number', description: 'tool-failure-rate：失败率阈值 0-1（缺省 0.3）' },
       minSamples: { type: 'number', description: 'tool-failure-rate：survived 检查点间隔（调用数，缺省 20）——样本达此数整数倍且未越阈值时记一条「经受住检验」证据（能证实，不只证伪）' },
@@ -394,6 +457,9 @@ export function apply(ctx: Context, config: Config): void {
       planWindowMs: { type: 'number', description: 'plan-before-action：突发起点前多长窗口内需出现 todo_write 才算「有规划」（缺省 3 分钟）' },
       minActions: { type: 'number', description: 'probe-before-action：突发内实施类调用达此数算实施突发（缺省 3）' },
       probeWindowMs: { type: 'number', description: 'probe-before-action：首个实施动作前回看多久算「行动前探测」（缺省 15 分钟）' },
+      claimWindowMs: { type: 'number', description: 'claim-vs-evidence：观测窗口 ms（缺省 6 小时）' },
+      minArranged: { type: 'number', description: 'claim-vs-evidence：窗口内至少多少条「自我安排」自述才判定（缺省 5）' },
+      claimCheckIntervalMs: { type: 'number', description: 'claim-vs-evidence：两次检查最小间隔 ms（缺省 5 分钟）' },
       threshold: { type: 'number', description: 'finding 证据阈值（缺省插件配置）' },
       source: { type: 'string', description: '来源（缺省 alice）' },
     },
@@ -411,7 +477,7 @@ export function apply(ctx: Context, config: Config): void {
       },
       render: (_a: unknown, v: any) => [{ type: 'text', text: v.ok ? '已添加自我假设 [' + v.id + ']（' + v.status + '，阈值 ' + v.threshold + '）——插件开始被动采证。' : '添加失败：' + String(v.error ?? '') }],
     },
-    async execute(args: { statement: string; prediction: string; kind: ProbeKind; tool?: string; failureRateAbove?: number; minSamples?: number; windowMs?: number; repeatCount?: number; minSteps?: number; burstGapMs?: number; planWindowMs?: number; minActions?: number; probeWindowMs?: number; threshold?: number; source?: string }) {
+    async execute(args: { statement: string; prediction: string; kind: ProbeKind; tool?: string; failureRateAbove?: number; minSamples?: number; windowMs?: number; repeatCount?: number; minSteps?: number; burstGapMs?: number; planWindowMs?: number; minActions?: number; probeWindowMs?: number; claimWindowMs?: number; minArranged?: number; claimCheckIntervalMs?: number; threshold?: number; source?: string }) {
       const state = loadState(statePath)
       const threshold = args.threshold ?? config.findingThreshold
       const probe: Probe = { kind: args.kind }
@@ -425,6 +491,9 @@ export function apply(ctx: Context, config: Config): void {
       if (args.planWindowMs !== undefined) probe.planWindowMs = args.planWindowMs
       if (args.minActions !== undefined) probe.minActions = args.minActions
       if (args.probeWindowMs !== undefined) probe.probeWindowMs = args.probeWindowMs
+      if (args.claimWindowMs !== undefined) probe.claimWindowMs = args.claimWindowMs
+      if (args.minArranged !== undefined) probe.minArranged = args.minArranged
+      if (args.claimCheckIntervalMs !== undefined) probe.claimCheckIntervalMs = args.claimCheckIntervalMs
       const h: Hypothesis = {
         id: nextId(),
         statement: args.statement,
