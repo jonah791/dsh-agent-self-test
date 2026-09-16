@@ -159,6 +159,7 @@ selftest_review(confirm, ruleDraft) → wireRuleToAgents → AGENTS.md marker �
 | A10 | **假设极性生效**：`selftest_list` 对每条假设给出方向判定，并标出「状态=confirmed 但方向=反对/混杂」的存量误判 | 修复前 `polaritySuspects=7`（6 反对 + 1 混杂，逐条 id 见 §9 记录）；7 条处置后归零 | ✓ 已实测 |
 | A11 | **裁决护栏 + 返回值无损**：方向相悖时 `selftest_review` 返回 `polarityWarning`（不阻断）；可选键**不存在**而非 `undefined` | 线上两次 refine 返回 `裁决完成：…（证据 0 条；方向 mixed）`，无 `invalid output: value is not lossless JSON` | ✓ 已实测 |
 | A12 | 五族探针载荷契约统一（`verdict` 字段 + 词表 `violated`/`survived`） | `node --test "tests/*.test.mjs"` → `# tests 68 / # pass 68 / # fail 0`（含 `tests/polarity.test.mjs` 的「载荷契约」两例） | ✓ 已实测 |
+| A13 | **对照组补齐**：`plan-before-action` 能采到「有规划且零失败」的**正向**证据（旧实现结构上只产违规证据） | **单测**：`node --test "tests/*.test.mjs"` → `# tests 74 / # pass 74 / # fail 0`（+6 例双路径夹具）。**线上**：受控实验（人为造 >60s 空隙 ⇒ 新突发以 `todo_write` 诞生 ⇒ 同批补满 5 次零失败调用）后 `h-mu4judte-1` **自动采到 survived**（证据 1/3、方向「支持」） | ✓ 已实测 |
 
 ## 8 · 与实现的关系
 
@@ -169,7 +170,7 @@ selftest_review(confirm, ruleDraft) → wireRuleToAgents → AGENTS.md marker �
   2. `evidence` 数组**无上限**（`addEvidence` 只 push）——长期运行的假设会无限增长（当前 16 条假设文件 41.5KB，尚可）。
   3. 通知失败不重试（§5 失败面）。
   4. `read-repeat` 的 `readTimes` 只留最近 20 次且**仅内存**：重启即失忆。
-  5. **`plan-before-action` 没有对照组**（2026-09-17 补记，见 U6）：它只记录「无规划 + ≥1 失败」这一个象限，合规突发不产证据 ⇒ 条件型主张（「不规划 ⇒ 更易失败」）在结构上**不可判**。未补对照组前，该类假设不得 confirm。
+  5. ~~**`plan-before-action` 没有对照组**~~ **已闭环（2026-09-17，任务 t-bede2fab）**：`burst.ts` 现有双路径结算（有规划 + 零失败 ⇒ `verdict:'survived'`；无规划 + ≥1 失败 ⇒ `verdict:'violated'`；其余两种形态不记），并修正了旧实现把 `hadPlan` 写死为 `false` 的自相矛盾（`hadPlan` 与 `verdict` 必须自洽）。**残余限制**：探针产出的是**单次事件**而非**比率** ⇒ 「有规划突发的失败率更低」这类**比较型**主张仍需聚合层（见 U7）。
 - **生效判据**（改了代码后怎么证明真的生效）：
   1. **产物 vs 进程**：`lib/index.js` mtime 早于 web 进程启动时间（当前 09-12 22:03:23 < 09-14 10:05:47 ✓ live）。**改了探针代码必须重建 + 重启**才生效。
   2. **落盘物证**：`$DSH_HOME/agent-self-test/self-test.json` 的 mtime 前进（每次采证/裁决都写）；`backups/` 出现新 `.bak-*`（布线）。
@@ -207,6 +208,16 @@ selftest_review(confirm, ruleDraft) → wireRuleToAgents → AGENTS.md marker �
   1. **「方向住在人脑子里」是一种静默失真**：三族探针不写方向字段，方向靠「这类探针只在违规时发射」的隐式约定 ⇒ 任何消费方都得自己猜，猜错就把「被证伪」读成「被证实」（本条已证）。
   2. **可选键绝不可写成 `x ?? undefined`**：`JSON.parse(JSON.stringify(v))` 会丢掉该键 ⇒ 与原值不等 ⇒ 宿主判 `invalid output: value is not lossless JSON`。要点：**execute 的副作用已落盘，只是返回值被拒**（本次 6 条裁决靠这一事实落地，靠事后 `selftest_list` 复核确认，而非假定）。
 
+**2026-09-17 追加：突发边界与 `hadPlan` 冻结语义（受控实验 · 任务 `t-bede2fab`）**
+
+- **现象**：v0.5.0 上线后 `plan-before-action` 连续多批调用「零证据」——**不是 survived 没火，是该探针根本没触发**（同期同族 `probe-before-action` 正常产出 2 条 survived，证明传感器与主会话过滤都健康）。
+- **受控实验**（决定性）：① 先跑一次 120s 调用，人为制造 > `burstGapMs`(60s) 的空隙 ⇒ 旧突发确定性结束；② 下一批**首个调用即 `todo_write`**（新突发诞生时 `lastTodoTs = now` ⇒ `hadPlan=true`）；③ 同批紧凑补满 5 次调用且零失败 ⇒ **survived 自动产出**（`h-mu4judte-1` 证据 1/3、方向「支持」）。
+- **机制结论（文档必须写清，否则下一个维护者会重复我的三次误判）**：
+  1. **突发边界由「相邻调用间隔 > `burstGapMs`」决定，不由「回合/批次」决定**——连续批次（间隔 <60s）会**合并**成同一突发。
+  2. **`hadPlan` 在突发诞生瞬间冻结**：同一突发内后补 `todo_write` **无效** ⇒ 「规划」必须真的发生在突发**之前**（与 §5.8 序位判据语义一致：台账先落，再动手）。
+  3. 因此在「长会话 + 连续批次」模式下，该探针可长时间停在 active 而不产证据——**这是边界，不是故障**；要拿到正向证据，需要一次「真实空隙 + 规划开场」的突发。
+- **方法论教训**：连续三次「我以为的原因」（突发被切开 → 传感器死 → 接线坏）**全被推翻**，第四次靠**人为造条件的受控实验**才定性。**能造条件的，就不要靠推断。**
+
 ## 10 · 未决问题
 
 - **U1 探针工具清单的自维护**：`PROBE_TOOLS`/`MUTATING_TOOLS` 靠手维护（新增工具后不会自动归类）。倾向：加一条 `claim-vs-evidence` 式元假设——「未分类的工具占比 > X%」即提示清单腐化。
@@ -214,4 +225,5 @@ selftest_review(confirm, ruleDraft) → wireRuleToAgents → AGENTS.md marker �
 - **U3 evidence 数组无上限**：倾向保留最近 N 条 + 计数（裁决只需条数与方向，不需全部明细）。
 - **U4 finding 通知失败无重试**：是否改为「落盘待通知队列 + 启动补发」（与 telegram outbox 同款）？
 - **U5 `workspaceDir` 缺省 `process.cwd()`**：web 进程 cwd 是工作区，但 watch/sentinel 类场景下 cwd 可能不同——是否需要像其他插件一样显式配置？
-- **U6 `plan-before-action` 缺对照组**（2026-09-17 新增）：本族只有违规路径 ⇒ 条件型/相关型主张结构上不可判（实测已有 2 条假设因此被证伪）。倾向：给 `src/burst.ts` 补 survived 路径（合规突发且零失败 ⇒ 记 `verdict:'survived'`，同 `probe.ts` 2026-09-17 所做），补齐后重开该类检验。
+- ~~**U6 `plan-before-action` 缺对照组**~~ **已闭环（2026-09-17，任务 t-bede2fab）**：`src/burst.ts` 已补 `survived` 路径（有规划且零失败），并修正 `hadPlan` 写死为 `false` 的自相矛盾；重开检验见 `h-mu4judte-1`（验收 A13）。
+- **U7 比较型主张仍需聚合层**（2026-09-17 新增）：五族探针产出的是**单次事件**（`violated`/`survived`），而「有规划突发的失败率**低于**无规划突发」这类**比率比较**主张需要跨突发的分子/分母（含未达 `minSteps` 的短突发）——当前无聚合面 ⇒ 该类主张仍**不可判**（**禁止用事件计数冒充比率**：那样会把「对照组多」读成「对照组更好」）。倾向：加按「有无规划」分桶的计数器（`planned:{bursts,failures}` / `unplanned:{...}`）+ 存活期随状态落盘，并用一条元假设检验其稳定性。

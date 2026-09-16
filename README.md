@@ -54,9 +54,11 @@ graph LR
 |------|---------|-----------------|---------|
 | `tool-failure-rate` | 工具失败率（**双向**） | ① 失败率 ≥ `failureRateAbove`（0.3）记一条 `violated`；② 调用数达 `minSamples`（20）整数倍且未越阈值记一条 `survived`（经受住检验） | 「工具 X 不可靠（失败率 ≥30%）」 |
 | `read-repeat` | 同一路径重复读取 | 窗口 `windowMs`（10 分钟）内同路径读 ≥ `repeatCount`（2）次 ⇒ 记 `verdict: 'violated'` | 「我倾向重复读同一文件（健忘信号）」 |
-| `plan-before-action` | 复杂多步任务前的规划 | 调用突发（间隔 < `burstGapMs` 60s、长度 ≥ `minSteps` 5）起点前 `planWindowMs`（3 分钟）内无 `todo_write`，且突发内失败 ≥ 1 ⇒ 记 `verdict: 'violated'`（⚠ 本族**尚无 survived 路径**：合规突发不产证据 ⇒「我会先规划」类主张结构上不可确认，缺口见 `src/burst.ts` 注释） | 「不先规划会更多返工」 |
+| `plan-before-action` | 复杂多步任务前的规划（**双向**，2026-09-17 补齐） | 突发（间隔 < `burstGapMs` 60s、长度 ≥ `minSteps` 5）：① 起点前 `planWindowMs`（3 分钟）内无 `todo_write` 且突发内失败 ≥ 1 ⇒ `verdict: 'violated'`；② 有 `todo_write` 且突发内**零失败** ⇒ `verdict: 'survived'`（对照组）；③ 其余形态（无规划零失败 / 有规划撞墙）⇒ 不记（诚实留白） | 「我会先规划」/「不先规划会更多返工」 |
 | `probe-before-action` | 实施前的**证伪探测** | 实施突发（mutating 调用 ≥ `minActions` 3）的首个动作前 `probeWindowMs`（15 分钟）内无探测且突发内失败 ≥ 1 ⇒ `verdict: 'violated'`；探测过且**零失败** ⇒ `verdict: 'survived'`（探测过但撞墙 ⇒ 不产证据，诚实留白） | 「驱动方案前会先做最小证伪实验」 |
 | `claim-vs-evidence` | **机制自述与落盘实证的一致性** | 窗口 `claimWindowMs`（6 小时）内「自我安排」自述 ≥ `minArranged`（5）却**零**「自我感知圈触发」→ 判假活（`verdict: 'violated'`）；自述与实证并存 ⇒ `verdict: 'survived'`（`claimCheckIntervalMs` 5 分钟为两次检查最小间隔） | 「我说要安排感知圈，就真的会有感知圈」 |
+
+**`plan-before-action` 的两个边界语义（2026-09-17 受控实验实证，别重复踩）**：① **突发边界由「相邻调用间隔 > `burstGapMs`」决定，不由「回合/批次」决定**——连续批次（间隔 <60s）会**合并**成一个长突发；② **`hadPlan` 在突发诞生瞬间冻结**，同一突发内后补 `todo_write` **无效** ⇒ 「规划」必须真的发生在突发**之前**（与 §5.8 序位判据同义：台账先落，再动手）。因此在长会话 + 连续批次的工作模式下，该探针可能长时间停在 active 而不产任何证据——**这是边界，不是故障**；要拿到正向证据，需要一次「真实空隙（>60s）+ 规划开场」的突发。
 
 **`tool-failure-rate` 为什么必须双向**：早期实现只在 `isError` 时采证 → 「X 可靠」这类假设**结构上无法被证实**，永远停在 active 并污染感知圈报告（实测 2 条假设证据恒 0）。现在两种证据都采（`detail.verdict` 区分 `violated` / `survived`），finding 通知也按方向给不同文案——「假设经受住检验」与「finding 浮现」是**相反的行动信号**。
 
