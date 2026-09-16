@@ -26,6 +26,8 @@ import type { BurstEvidence } from './burst.ts'
 import { createProbeFirstTracker, PROBEFIRST_DEFAULTS } from './probe.ts'
 import type { ProbeFirstEvidence } from './probe.ts'
 import { CLAIM_DEFAULTS, countLifeCycleClaims, decideClaimEvidence } from './claim-evidence.ts'
+import { computeDirection, resolvePolarity, contradictsDirection } from './polarity.ts'
+import type { DirectionReport, Polarity, ProbeKind } from './polarity.ts'
 
 export const name = 'agent-self-test'
 export const inject = ['tools', 'agents'] as const
@@ -54,12 +56,17 @@ export const Config = z.object({
   workspaceDir: z.string().required(false),
 })
 
-/** 探针类型 */
-export type ProbeKind = 'tool-failure-rate' | 'read-repeat' | 'plan-before-action' | 'probe-before-action' | 'claim-vs-evidence'
+/** 探针类型（单一真源 = polarity.ts —— 禁止两份定义各自漂移，§5.22 判据单一真源） */
+export type { ProbeKind } from './polarity.ts'
 
 /** 探针定义（声明式条件观察器） */
 export interface Probe {
   kind: ProbeKind
+  /**
+   * 假设极性（2026-09-17，任务 t-56b052fb）：violated 事件对**这条假设**意味着什么。
+   * 缺省按探针 kind 取 DEFAULT_POLARITY（见 polarity.ts）；显式声明优先。
+   */
+  polarity?: Polarity
   /** tool-failure-rate：目标工具名（不填 = 全部工具） */
   tool?: string
   /** tool-failure-rate：失败率阈值（0-1，如 0.3 = 失败率 ≥30% 记一条「违规」证据） */
@@ -276,19 +283,17 @@ export function apply(ctx: Context, config: Config): void {
       console.log('[dsh-agent-self-test] finding 通知跳过：agent 未找到', new Date().toISOString())
       return
     }
-    // 方向感知（2026-09-11）：证据含两种 verdict——survived（经受住检验）与 violated（违规）。
-    // 通知文案必须区分，否则「假设被证实」会被当成「假设出问题」，裁决方向就反了。
-    const survivedCount = h.evidence.filter((e) => (e.detail as { verdict?: string } | undefined)?.verdict === 'survived').length
-    const violatedCount = h.evidence.length - survivedCount
-    const promoting = h.evidence[h.evidence.length - 1]
-    const promotedBySurvival = (promoting?.detail as { verdict?: string } | undefined)?.verdict === 'survived'
-    const headline = promotedBySurvival ? '✓ 假设经受住检验' : '⚠ finding 浮现'
-    const tally = violatedCount > 0 && survivedCount > 0
-      ? `（证据 ${h.evidence.length}/${h.threshold} 条：经受住 ${survivedCount} / 违规 ${violatedCount}——**证据方向混杂，建议 refine 细化判定条件**）`
-      : (survivedCount > 0
-        ? `（经受住检验 ${survivedCount}/${h.threshold} 次）`
-        : `（违规证据 ${h.evidence.length}/${h.threshold} 条）`)
-    const text = '[self-test] ' + headline + '：' + h.statement + tally +
+    // 方向判定统一走 polarity.ts（2026-09-17，任务 t-56b052fb）：判据单一真源，禁止各消费方自实现。
+    // 旧实现在此处只读 `detail.verdict`，而三族探针（read-repeat / plan-before-action /
+    // probe-before-action）当时根本不写该字段 ⇒ 方向被判成「未知 → 有待证实」，通知文案于是把
+    // 「违规证据已足」说成「finding 浮现 / 假设经受住检验」——4 条「我会先做 X」型假设就是这么被误确认的。
+    const dir = computeDirection(h.evidence, h.probe)
+    const headline = dir.direction === 'support' ? '✓ 证据支持该假设'
+      : dir.direction === 'refute' ? '✗ 证据指向该假设不成立'
+        : dir.direction === 'mixed' ? '⚠ 证据方向混杂'
+          : '⚠ finding 浮现（方向未知）'
+    const text = '[self-test] ' + headline + '：' + h.statement +
+      `（证据 ${h.evidence.length}/${h.threshold} 条；${dir.text}）` +
       '——该裁决了：selftest_review（confirm 布线 / refute 淘汰 / refine 细化）。'
     // Branded MessageId 跨包版本冲突（harness packages/llm vs 插件 node_modules dsh-llm）无法在类型层调和，
     // 与 emotion 插件同款宽松绕过；运行时行为正确
@@ -395,7 +400,10 @@ export function apply(ctx: Context, config: Config): void {
               if (addEvidence(h, {
                 ts: nowIso(),
                 kind: 'read-repeat',
-                detail: { path, readsInWindow: inWindow, windowMs },
+                // verdict 显式标注（2026-09-17）：命中即「验证了『又不该地重复读了』」——
+                // 这是**事件属性**；它对这条假设是支持还是反对由 probe.polarity 决定
+                //（「我倾向于重复读」这类自省缺陷型主张 ⇒ 默认 violation-supports）。
+                detail: { path, readsInWindow: inWindow, windowMs, verdict: 'violated' },
               })) justFinding.push(h)
               changed = true
             }
@@ -461,6 +469,7 @@ export function apply(ctx: Context, config: Config): void {
       minArranged: { type: 'number', description: 'claim-vs-evidence：窗口内至少多少条「自我安排」自述才判定（缺省 5）' },
       claimCheckIntervalMs: { type: 'number', description: 'claim-vs-evidence：两次检查最小间隔 ms（缺省 5 分钟）' },
       threshold: { type: 'number', description: 'finding 证据阈值（缺省插件配置）' },
+      polarity: { type: 'string', enum: ['violation-refutes', 'violation-supports'], description: '假设极性（2026-09-17）：violated 事件对**这条假设**意味着什么。violation-refutes = 主张「我会做 X」（缺省；read-repeat 除外）；violation-supports = 主张「我倾向做 X」（自省缺陷型，如 read-repeat）。不填 = 按探针 kind 取默认并物化写入。' },
       source: { type: 'string', description: '来源（缺省 alice）' },
     },
     output: {
@@ -477,10 +486,12 @@ export function apply(ctx: Context, config: Config): void {
       },
       render: (_a: unknown, v: any) => [{ type: 'text', text: v.ok ? '已添加自我假设 [' + v.id + ']（' + v.status + '，阈值 ' + v.threshold + '）——插件开始被动采证。' : '添加失败：' + String(v.error ?? '') }],
     },
-    async execute(args: { statement: string; prediction: string; kind: ProbeKind; tool?: string; failureRateAbove?: number; minSamples?: number; windowMs?: number; repeatCount?: number; minSteps?: number; burstGapMs?: number; planWindowMs?: number; minActions?: number; probeWindowMs?: number; claimWindowMs?: number; minArranged?: number; claimCheckIntervalMs?: number; threshold?: number; source?: string }) {
+    async execute(args: { statement: string; prediction: string; kind: ProbeKind; polarity?: Polarity; tool?: string; failureRateAbove?: number; minSamples?: number; windowMs?: number; repeatCount?: number; minSteps?: number; burstGapMs?: number; planWindowMs?: number; minActions?: number; probeWindowMs?: number; claimWindowMs?: number; minArranged?: number; claimCheckIntervalMs?: number; threshold?: number; source?: string }) {
       const state = loadState(statePath)
       const threshold = args.threshold ?? config.findingThreshold
-      const probe: Probe = { kind: args.kind }
+      // 极性物化（2026-09-17）：显式声明优先；未声明则把该探针的默认值**写进数据**——
+      // 「极性住在数据里」是本次修复的核心，不能继续靠消费方回退到隐式默认表。
+      const probe: Probe = { kind: args.kind, polarity: args.polarity ?? resolvePolarity({ kind: args.kind }) }
       if (args.tool !== undefined) probe.tool = args.tool
       if (args.failureRateAbove !== undefined) probe.failureRateAbove = args.failureRateAbove
       if (args.minSamples !== undefined) probe.minSamples = args.minSamples
@@ -514,7 +525,7 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.tools.register(defineTool({
     name: 'selftest_list',
-    description: '列出自我假设库：每个假设的陈述/预测/探针/证据数/状态。可过滤状态（active/finding/confirmed/refuted）。用于查看正在检验的自我猜想进度。',
+    description: '列出自我假设库：每个假设的陈述/预测/探针/极性/证据方向/证据数/状态，并顺带做存量极性体检。可过滤状态（active/finding/confirmed/refuted）。方向由 polarity.ts 统一判定（支持/反对/混杂/未知）——confirmed 却「证据指向不成立」的行会标 ⚠极性存疑（裁决时方向读反了，该重新裁定）。',
     parameters: {
       status: { type: 'string', enum: ['active', 'finding', 'confirmed', 'refuted', 'archived'], description: '状态过滤' },
     },
@@ -525,6 +536,8 @@ export function apply(ctx: Context, config: Config): void {
         properties: {
           ok: { type: 'boolean', required: true },
           total: { type: 'number' },
+          /** 存量极性体检结论：状态=confirmed 但证据方向为「反对」或「混杂」的条数（>0 ⇒ 待复核） */
+          polaritySuspects: { type: 'number' },
           hypotheses: { type: 'json' },
         },
       },
@@ -535,22 +548,40 @@ export function apply(ctx: Context, config: Config): void {
         }
         const lines = hs.map((h: any) => {
           const statusMark = h.status === 'finding' ? '⚠FINDING' : h.status === 'confirmed' ? '✓' : h.status === 'refuted' ? '✗' : '·'
-          return `${statusMark} [${h.id}] ${h.statement}\n   预测: ${h.prediction}\n   探针: ${h.probe?.kind ?? '?'} | 证据 ${h.evidence?.length ?? 0}/${h.threshold} | ${h.status}`
+          const dir = h.direction ?? {}
+          const dirMark = dir.direction === 'support' ? '支持' : dir.direction === 'refute' ? '反对' : dir.direction === 'mixed' ? '混杂' : '未知'
+          const suspect = h.polaritySuspect === true ? ' ⚠极性存疑（状态与证据方向相悖）' : ''
+          return `${statusMark} [${h.id}] ${h.statement}\n   预测: ${h.prediction}\n   探针: ${h.probe?.kind ?? '?'}（极性 ${h.probe?.polarity ?? '默认'}） | 证据 ${h.evidence?.length ?? 0}/${h.threshold} | 方向 ${dirMark}（支持 ${dir.support ?? 0}/反对 ${dir.refute ?? 0}${dir.legacyAssumed > 0 ? `/推定 ${dir.legacyAssumed}` : ''}） | ${h.status}${suspect}`
         })
-        return [{ type: 'text', text: `自我假设库（${hs.length}）\n` + lines.join('\n') }]
+        const head = v.polaritySuspects > 0
+          ? `⚠ 极性存疑 ${v.polaritySuspects} 条——状态与证据方向相悖，疑似裁决时把方向读反了 ⇒ 逐条处置：refine（重建断言、清旧证据重新采证）或 refute（淘汰）。\n`
+          : ''
+        return [{ type: 'text', text: head + `自我假设库（${hs.length}）\n` + lines.join('\n') }]
       },
     },
     async execute(args: { status?: string }) {
       const state = loadState(statePath)
       let hs = state.hypotheses
       if (args.status !== undefined) hs = hs.filter((h) => h.status === args.status)
-      return { ok: true, total: hs.length, hypotheses: JSON.parse(JSON.stringify(hs)) }
+      const enriched = hs.map((h) => {
+        const direction: DirectionReport = computeDirection(h.evidence, h.probe)
+        // 存量极性体检（2026-09-17）：状态说「成立」而证据方向是「反对」或「混杂」= 待复核指纹。
+        // 只算 refute 会漏掉「confirmed 但证据两个方向都有」这一类（实测 h-mu0qvlm1-2 就是漏网的）。
+        const polaritySuspect = h.status === 'confirmed' && direction.direction !== 'support'
+        return { ...h, direction, polaritySuspect }
+      })
+      return {
+        ok: true,
+        total: enriched.length,
+        polaritySuspects: enriched.filter((h) => h.polaritySuspect).length,
+        hypotheses: JSON.parse(JSON.stringify(enriched)),
+      }
     },
   }))
 
   ctx.tools.register(defineTool({
     name: 'selftest_findings',
-    description: '列出待裁决的 finding（证据达阈值的 active 假设）。finding = 自我猜想被真实行为证实的信号——用 selftest_review 裁决（confirm 布线 / refute 淘汰 / refine 细化）。',
+    description: '列出待裁决的 finding（证据达阈值的 active 假设）。⚠ finding 只说明「证据够了」，**方向要另看**：证据指向支持 ⇒ confirm（布线）/ 指向反对 ⇒ refute（淘汰）/ 混杂 ⇒ refine（细化判定条件）——每条 finding 附 direction 判定，按它裁决。',
     parameters: {},
     output: {
       schema: {
@@ -564,27 +595,35 @@ export function apply(ctx: Context, config: Config): void {
       },
       render: (_a: unknown, v: any) => {
         const fs = v.findings ?? []
-        if (fs.length === 0) return [{ type: 'text', text: '暂无待裁决 finding——没有自我猜想被证据证实到阈值。' }]
-        const lines = fs.map((f: any) => `⚠ [${f.id}] ${f.statement}\n   证据 ${f.evidence?.length ?? 0} 条，最近: ${f.evidence?.slice(-3).map((e: any) => e.kind).join(',') ?? '?'}`)
-        return [{ type: 'text', text: `待裁决 finding（${fs.length}）——证据已足，该裁决了:\n` + lines.join('\n') }]
+        if (fs.length === 0) return [{ type: 'text', text: '暂无待裁决 finding——没有自我猜想的证据达阈值。' }]
+        const lines = fs.map((f: any) => {
+          const dir = f.direction ?? {}
+          return `⚠ [${f.id}] ${f.statement}\n   证据 ${f.evidence?.length ?? 0}/${f.threshold} 条 | ${dir.text ?? '方向未知'}`
+        })
+        return [{ type: 'text', text: `待裁决 finding（${fs.length}）——证据已足，**按方向裁决**：\n` + lines.join('\n') }]
       },
     },
     async execute() {
       const state = loadState(statePath)
       const findings = state.hypotheses.filter((h) => h.status === 'finding')
-      return { ok: true, count: findings.length, findings: JSON.parse(JSON.stringify(findings)) }
+      return {
+        ok: true,
+        count: findings.length,
+        findings: JSON.parse(JSON.stringify(findings.map((h) => ({ ...h, direction: computeDirection(h.evidence, h.probe) })))),
+      }
     },
   }))
 
   ctx.tools.register(defineTool({
     name: 'selftest_review',
-    description: '裁决一条 finding：verdict=confirm 把被证实的模式标 confirmed 并生成 AGENTS.md 规则草案（供布线）；refute 标 refuted（淘汰未被证实的猜想）；refine 改 statement/阈值后回到 active 继续采证。',
+    description: '裁决一条假设：verdict=confirm 标 confirmed 并生成 AGENTS.md 规则草案（供布线）；refute 标 refuted（淘汰）；refine 改 statement/阈值/极性后回到 active 重新采证（旧证据清空）。裁决前会用 polarity.ts 算证据方向：当裁决动作与方向相悖（如方向=反对却 confirm）时返回 polarityWarning —— **只提示不阻断**，决策权归爱丽丝（§2.1）。',
     parameters: {
       id: { type: 'string', required: true, description: '假设 id' },
       verdict: { type: 'string', required: true, enum: ['confirm', 'refute', 'refine'], description: '裁决' },
       ruleDraft: { type: 'string', description: 'confirm 时：AGENTS.md 规则草案' },
       newStatement: { type: 'string', description: 'refine 时：新陈述' },
       newThreshold: { type: 'number', description: 'refine 时：新阈值' },
+      polarity: { type: 'string', enum: ['violation-refutes', 'violation-supports'], description: '修正假设极性（violation-refutes=主张「我会做 X」；violation-supports=自省缺陷型「我倾向做 X」）——refine 重建断言时通常要一起校正' },
       resolution: { type: 'string', description: '裁决记录' },
     },
     output: {
@@ -596,13 +635,22 @@ export function apply(ctx: Context, config: Config): void {
           id: { type: 'string' },
           status: { type: 'string' },
           evidence: { type: 'number' },
+          direction: { type: 'string' },
+          polarityWarning: { type: 'string' },
           wired: { type: 'json' },
           error: { type: 'string' },
         },
       },
-      render: (_a: unknown, v: any) => [{ type: 'text', text: v.ok ? ('裁决完成：[' + v.id + '] → ' + v.status + '（证据 ' + v.evidence + ' 条）' + (v.wired ? ' ⚡ 已自动布线 AGENTS.md' : '')) : '裁决失败：' + String(v.error ?? '') }],
+      render: (_a: unknown, v: any) => [{
+        type: 'text',
+        text: v.ok
+          ? ('裁决完成：[' + v.id + '] → ' + v.status + '（证据 ' + v.evidence + ' 条；方向 ' + String(v.direction ?? '未知') + '）'
+            + (v.wired ? ' ⚡ 已自动布线 AGENTS.md' : '')
+            + (v.polarityWarning ? '\n' + v.polarityWarning : ''))
+          : '裁决失败：' + String(v.error ?? ''),
+      }],
     },
-    async execute(args: { id: string; verdict: 'confirm' | 'refute' | 'refine'; ruleDraft?: string; newStatement?: string; newThreshold?: number; resolution?: string }) {
+    async execute(args: { id: string; verdict: 'confirm' | 'refute' | 'refine'; ruleDraft?: string; newStatement?: string; newThreshold?: number; polarity?: Polarity; resolution?: string }) {
       const state = loadState(statePath)
       const h = state.hypotheses.find((x) => x.id === args.id)
       if (h === undefined) return { ok: false, error: `hypothesis ${args.id} not found` }
@@ -610,10 +658,21 @@ export function apply(ctx: Context, config: Config): void {
         return { ok: false, error: `only finding can be confirmed (current: ${h.status})` }
       }
       h.updatedAt = nowIso()
+      // 方向判定（2026-09-17）：裁决前先看清证据指向什么，与动作相悖就响亮提示（不阻断）
+      const dir = computeDirection(h.evidence, h.probe)
+      let polarityWarning: string | null = null
+      if (args.verdict !== 'refine' && contradictsDirection(args.verdict, dir.direction)) {
+        polarityWarning = `⚠ 护栏提示：${dir.text} —— 而你选择了 ${args.verdict}。`
+          + (dir.direction === 'refute'
+            ? '若主张本就该被证伪（「我不会 X」型），正确动作通常是 refute 或 refine（改写断言后重新采证）。'
+            : '若已确认要逆方向裁定，请在 resolution 写明理由（本次已照办）。')
+      }
+      if (args.polarity !== undefined) h.probe.polarity = args.polarity
       let wired: { wired: boolean; file?: string; error?: string } | null = null
+      const note = (base: string): string => polarityWarning === null ? base : base + ' ｜ ' + polarityWarning
       if (args.verdict === 'confirm') {
         h.status = 'confirmed'
-        h.resolution = args.resolution ?? 'confirmed by evidence'
+        h.resolution = note(args.resolution ?? 'confirmed by evidence')
         h.note = args.ruleDraft ?? h.note
         // 自动布线（2026-09-06）：ruleDraft 非空 → 写入 AGENTS.md（五环「布线」自动化）
         if (args.ruleDraft !== undefined && args.ruleDraft.trim().length > 0) {
@@ -621,7 +680,7 @@ export function apply(ctx: Context, config: Config): void {
         }
       } else if (args.verdict === 'refute') {
         h.status = 'refuted'
-        h.resolution = args.resolution ?? 'refuted by evidence'
+        h.resolution = note(args.resolution ?? 'refuted by evidence')
       } else if (args.verdict === 'refine') {
         h.status = 'active'
         if (args.newStatement !== undefined) h.statement = args.newStatement
@@ -630,7 +689,20 @@ export function apply(ctx: Context, config: Config): void {
         h.resolution = args.resolution ?? 'refined, re-collecting evidence'
       }
       saveState(statePath, state)
-      return { ok: true, id: h.id, status: h.status, evidence: h.evidence.length, wired: wired?.wired === true ? { file: wired.file ?? '' } : null }
+      // ⚠ 输出必须 lossless JSON（2026-09-17 实测事故）：把 `polarityWarning` 写进对象再赋 `undefined`
+      // 会让 `JSON.parse(JSON.stringify(v))` 与原值不等（键被 stringify 丢掉）⇒ 宿主判
+      // `invalid output: value is not lossless JSON`（**execute 的副作用已落盘，只是返回值被拒**）。
+      // 正确做法：可选键**不存在**，而不是「存在但为 undefined」。
+      const out: { ok: boolean; id: string; status: string; evidence: number; direction: string; polarityWarning?: string; wired: { file: string } | null } = {
+        ok: true,
+        id: h.id,
+        status: h.status,
+        evidence: h.evidence.length,
+        direction: dir.direction,
+        wired: wired?.wired === true ? { file: wired.file ?? '' } : null,
+      }
+      if (polarityWarning !== null) out.polarityWarning = polarityWarning
+      return out
     },
   }))
 

@@ -42,23 +42,44 @@ graph LR
 | 工具 | 用途（描述取自源码，逐字） |
 |------|--------------------------|
 | `selftest_add` | 添加一条可证伪自我假设：`statement`（关于自己行为的可证伪陈述）+ `prediction`（可观测预测）+ `probe`（探针）。插件在真实工具调用中被动采证，证据达 threshold 转 finding 供裁决 |
-| `selftest_list` | 列出自我假设库：每个假设的陈述/预测/探针/证据数/状态。可过滤状态（`active`/`finding`/`confirmed`/`refuted`）。用于查看正在检验的自我猜想进度 |
-| `selftest_findings` | 列出待裁决的 finding（证据达阈值的 active 假设）。finding = 自我猜想被真实行为证实的信号——用 `selftest_review` 裁决 |
-| `selftest_review` | 裁决一条 finding：`confirm` 把被证实的模式标 confirmed 并生成 AGENTS.md 规则草案（供布线）；`refute` 标 refuted（淘汰未被证实的猜想）；`refine` 改 statement/阈值后回到 active 继续采证 |
+| `selftest_list` | 列出自我假设库：每个假设的陈述/预测/探针/极性/证据方向/证据数/状态，并顺带做存量极性体检。可过滤状态（`active`/`finding`/`confirmed`/`refuted`）。方向由 `polarity.ts` 统一判定（支持/反对/混杂/未知）——confirmed 却「证据指向不成立」的行会标 ⚠极性存疑（裁决时方向读反了，该重新裁定） |
+| `selftest_findings` | 列出待裁决的 finding（证据达阈值的 active 假设）。⚠ finding 只说明「证据够了」，**方向要另看**：证据指向支持 ⇒ `confirm`（布线）/ 指向反对 ⇒ `refute`（淘汰）/ 混杂 ⇒ `refine`（细化判定条件）——每条 finding 附 `direction` 判定，按它裁决 |
+| `selftest_review` | 裁决一条假设：`confirm` 标 confirmed 并生成 AGENTS.md 规则草案（供布线）；`refute` 标 refuted（淘汰）；`refine` 改 statement/阈值/极性后回到 active 重新采证（旧证据清空）。裁决前会用 `polarity.ts` 算证据方向：当裁决动作与方向相悖（如方向=反对却 confirm）时返回 `polarityWarning` —— **只提示不阻断**，决策权归爱丽丝（§2.1） |
 
-`selftest_add` 的关键参数（缺省值取自 `defineTool` schema）：`kind`（探针类型，必需）、`threshold`（finding 证据阈值，缺省用插件配置）、`source`（来源，缺省 `alice`），以及每类探针自己的窗口/阈值参数（见下表）。`selftest_review` 额外接受 `ruleDraft`（confirm 时写入 AGENTS.md 的规则草案）、`newStatement` / `newThreshold`（refine 时）、`resolution`（裁决记录）。
+`selftest_add` 的关键参数（缺省值取自 `defineTool` schema）：`kind`（探针类型，必需）、`polarity`（假设极性，不填 = 按探针 kind 取默认并**物化写入**）、`threshold`（finding 证据阈值，缺省用插件配置）、`source`（来源，缺省 `alice`），以及每类探针自己的窗口/阈值参数（见下表）。`selftest_review` 额外接受 `ruleDraft`（confirm 时写入 AGENTS.md 的规则草案）、`newStatement` / `newThreshold` / `polarity`（refine 时）、`resolution`（裁决记录）。
 
 ## 探针（5 类声明式条件观察器）
 
 | kind | 观测什么 | 触发条件（默认） | 典型假设 |
 |------|---------|-----------------|---------|
 | `tool-failure-rate` | 工具失败率（**双向**） | ① 失败率 ≥ `failureRateAbove`（0.3）记一条 `violated`；② 调用数达 `minSamples`（20）整数倍且未越阈值记一条 `survived`（经受住检验） | 「工具 X 不可靠（失败率 ≥30%）」 |
-| `read-repeat` | 同一路径重复读取 | 窗口 `windowMs`（10 分钟）内同路径读 ≥ `repeatCount`（2）次 | 「我倾向重复读同一文件（健忘信号）」 |
-| `plan-before-action` | 复杂多步任务前的规划 | 调用突发（间隔 < `burstGapMs` 60s、长度 ≥ `minSteps` 5）起点前 `planWindowMs`（3 分钟）内无 `todo_write`，且突发内失败 ≥ 1 | 「不先规划会更多返工」 |
-| `probe-before-action` | 实施前的**证伪探测** | 实施突发（mutating 调用 ≥ `minActions` 3）的首个动作前 `probeWindowMs`（15 分钟）内无探测，且突发内失败 ≥ 1 | 「驱动方案前会先做最小证伪实验」 |
-| `claim-vs-evidence` | **机制自述与落盘实证的一致性** | 窗口 `claimWindowMs`（6 小时）内「自我安排」自述 ≥ `minArranged`（5）却**零**「自我感知圈触发」→ 判假活（`claimCheckIntervalMs` 5 分钟为两次检查最小间隔） | 「我说要安排感知圈，就真的会有感知圈」 |
+| `read-repeat` | 同一路径重复读取 | 窗口 `windowMs`（10 分钟）内同路径读 ≥ `repeatCount`（2）次 ⇒ 记 `verdict: 'violated'` | 「我倾向重复读同一文件（健忘信号）」 |
+| `plan-before-action` | 复杂多步任务前的规划 | 调用突发（间隔 < `burstGapMs` 60s、长度 ≥ `minSteps` 5）起点前 `planWindowMs`（3 分钟）内无 `todo_write`，且突发内失败 ≥ 1 ⇒ 记 `verdict: 'violated'`（⚠ 本族**尚无 survived 路径**：合规突发不产证据 ⇒「我会先规划」类主张结构上不可确认，缺口见 `src/burst.ts` 注释） | 「不先规划会更多返工」 |
+| `probe-before-action` | 实施前的**证伪探测** | 实施突发（mutating 调用 ≥ `minActions` 3）的首个动作前 `probeWindowMs`（15 分钟）内无探测且突发内失败 ≥ 1 ⇒ `verdict: 'violated'`；探测过且**零失败** ⇒ `verdict: 'survived'`（探测过但撞墙 ⇒ 不产证据，诚实留白） | 「驱动方案前会先做最小证伪实验」 |
+| `claim-vs-evidence` | **机制自述与落盘实证的一致性** | 窗口 `claimWindowMs`（6 小时）内「自我安排」自述 ≥ `minArranged`（5）却**零**「自我感知圈触发」→ 判假活（`verdict: 'violated'`）；自述与实证并存 ⇒ `verdict: 'survived'`（`claimCheckIntervalMs` 5 分钟为两次检查最小间隔） | 「我说要安排感知圈，就真的会有感知圈」 |
 
 **`tool-failure-rate` 为什么必须双向**：早期实现只在 `isError` 时采证 → 「X 可靠」这类假设**结构上无法被证实**，永远停在 active 并污染感知圈报告（实测 2 条假设证据恒 0）。现在两种证据都采（`detail.verdict` 区分 `violated` / `survived`），finding 通知也按方向给不同文案——「假设经受住检验」与「finding 浮现」是**相反的行动信号**。
+
+## 极性（polarity）：证据方向 ≠ 假设方向
+
+**两层语义必须分开，这是本插件最容易反的一处裁决：**
+
+1. **探针层 `verdict`** = **事件属性**：探针盯的规范被 `violated`（违反）还是 `survived`（经受住）。canonical 字段名是 **`detail.verdict`**（2026-09-17 统一；`readEventVerdict()` 兼容读取旧字段 `detail.kind` 与旧词形 `violation`）。
+2. **假设层 `polarity`** = **假设属性**：该事件对**这条假设**意味着什么。
+   - `violation-refutes`（默认，四族）：假设主张「我会做 X」⇒ `violated` 是**反对**证据
+   - `violation-supports`：假设主张「我倾向做 X」（自省缺陷型）⇒ `violated` 是**支持**证据
+
+例：`read-repeat` 的 `violated`（又重复读了）对「我不该重复读」是反对，对「我倾向于重复读」是**支持**——同一份证据，极性不同，裁决方向相反。
+
+| kind | 默认极性 | 理由 |
+|------|---------|------|
+| `tool-failure-rate` | `violation-refutes` | 主张「X 可靠」 |
+| `claim-vs-evidence` | `violation-refutes` | 主张「自述与实证一致（不假活）」 |
+| `plan-before-action` | `violation-refutes` | 主张「我会先规划」 |
+| `probe-before-action` | `violation-refutes` | 主张「我会先探测」 |
+| `read-repeat` | `violation-supports` | 主张「我倾向于重复读」（自省缺陷型） |
+
+**为什么要有这一节**（2026-09-17 事故，任务 `t-56b052fb`）：修复前只有两族写方向字段，另三族靠「这类探针只在违规时发射」的**隐式约定**——消费方一律把 finding 读成「假设被证实」，实测有 6 条「我会先做 X」型假设**被违规证据判成 confirmed**（方向反了）。现在方向由 `polarity.ts` 单一真源判定，`selftest_list` 对「状态说成立、证据说不成立」的行标 ⚠极性存疑；存量无标签证据按 `LEGACY_UNLABELED_VERDICT` 显式推定并在输出里报出条数（推定是显式的，不是暗的）。
 
 突发推进每工具调用只做一次（多假设不 double-count），证据广播给所有 active 的 `plan-before-action` 假设。
 

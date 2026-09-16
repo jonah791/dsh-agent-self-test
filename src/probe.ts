@@ -86,12 +86,33 @@ export function classifyShell(command: string): ToolRole {
   return 'neutral'
 }
 
+/**
+ * 能力面索引白名单（2026-09-16，任务 t-a3a047a1）
+ *
+ * 第 11-14 行的裁决不变：read/glob **默认**仍是 neutral（fs-policy 强制写前先 read，
+ * 若本地读一律算探测则「行动前有探测」近乎恒真、传感器失灵）。
+ * 但「先枚举既有能力面、再决定新造还是复用」这条纪律（§5.8 装了不用=没装）在仪器里
+ * 原本**没有任何可见通道** ⇒ 我把 read/glob 收缩到**能力索引类路径**时计为 probe。
+ *
+ * 白名单刻意极窄（宁缺勿滥）：只认仪器索引 `TOOLS.md`、自研插件目录、技能目录。
+ * 反例（必须仍为 neutral，见单测）：读自己的脚本/源码/普通文档。
+ */
+const CAPABILITY_PATH_RE = /(?:^|\/)(?:TOOLS\.md|self-plugins|\.agents\/skills)(?:\/|$)/
+
+export function isCapabilityLookup(name: string, args?: Record<string, unknown>): boolean {
+  if (name !== 'read' && name !== 'glob') return false
+  const raw = (args?.file_path ?? args?.path) as unknown
+  if (typeof raw !== 'string' || raw.length === 0) return false
+  return CAPABILITY_PATH_RE.test(raw.replace(/\\/g, '/'))
+}
+
 /** 工具角色分类（导出供单测）。args 用于 shell 命令动词启发。 */
 export function classifyTool(name: string, args?: Record<string, unknown>): ToolRole {
   if (name === 'pwsh' || name === 'wsl') {
     const cmd = args?.command
     return typeof cmd === 'string' ? classifyShell(cmd) : 'neutral'
   }
+  if (isCapabilityLookup(name, args)) return 'probe'
   if (PROBE_TOOLS.has(name)) return 'probe'
   if (MUTATING_TOOLS.has(name)) return 'mutating'
   return 'neutral'
@@ -113,7 +134,14 @@ export interface ProbeFirstEvidence {
   calls: number
   actions: number
   failures: number
-  hadProbeBefore: false
+  /**
+   * 探针层事件方向（canonical 字段名 = `verdict`，与 failure-rate / claim-evidence 统一；
+   * 2026-09-17 由 `kind: 'violation'` 改名而来 —— 旧名/旧词形仍被 readEventVerdict 兼容读取）：
+   *   violated = 零探测就冲且撞墙；survived = 行动前探测过且没撞墙
+   * 注意：这是**事件属性**；它对某条假设是支持还是反对，由该假设的 polarity 决定（见 polarity.ts）。
+   */
+  verdict: 'violated' | 'survived'
+  hadProbeBefore: boolean
   probeWindowMs: number
   lastProbeAgeMs: number | null
 }
@@ -150,7 +178,7 @@ export function createProbeFirstTracker(): ProbeFirstTracker {
       if (role === 'probe') tracker.lastProbeTs = now
 
       let evidence: ProbeFirstEvidence | null = null
-      const emit = (): void => {
+      const emit = (verdict: 'violated' | 'survived'): void => {
         if (evidence !== null || tracker.currentBurst === null) return
         const b = tracker.currentBurst
         evidence = {
@@ -158,15 +186,24 @@ export function createProbeFirstTracker(): ProbeFirstTracker {
           calls: b.calls,
           actions: b.actions,
           failures: b.failures,
-          hadProbeBefore: false,
+          verdict,
+          hadProbeBefore: b.hadProbeBefore,
           probeWindowMs,
           lastProbeAgeMs: tracker.lastProbeTs > 0 ? Math.round((b.startTs - tracker.lastProbeTs) / 1000) * 1000 : null,
         }
         b.evidenced = true
       }
+      /**
+       * 双路径结算（2026-09-17，任务 t-b2c2d903）：
+       * 旧实现**只有违规路径** ⇒ 任何「行动前探测过」的合规行为都永远不产证据，
+       * 于是「我会先探测再动手」这类假设在结构上不可确认（0/N 永远 0）。
+       * 补给 survived 路径后，同一探针能双向采证（对照 failure-rate 的 minSamples 检查点）。
+       */
       const tryEmit = (): void => {
         const b = tracker.currentBurst
-        if (b !== null && !b.evidenced && b.actions >= minActions && !b.hadProbeBefore && b.probeJudged && b.failures >= 1) emit()
+        if (b === null || b.evidenced || b.actions < minActions || !b.probeJudged) return
+        if (!b.hadProbeBefore && b.failures >= 1) { emit('violated'); return }
+        if (b.hadProbeBefore && b.failures === 0) { emit('survived'); return }
       }
 
       const isNew = tracker.currentBurst === null || now - tracker.currentBurst.lastTs > burstGapMs

@@ -155,7 +155,10 @@ selftest_review(confirm, ruleDraft) → wireRuleToAgents → AGENTS.md marker �
 | A6 | 采证只作用于主会话 | 让子代理触发工具 → `self-test.json` 证据数**不增** | 待验收 |
 | A7 | confirm 布线可回滚 | 布线后 `ls $DSH_HOME/agent-self-test/backups/` 出现 `.bak-<ts>`，内容为布线前的 AGENTS.md | 待验收 |
 | A8 | finding 通知真的落到会话 | 造一条阈值 1 的假设 + 触发一次匹配工具调用 → 会话出现 `[self-test] …` 消息 | 待验收 |
-| A9 | 双证据方向区分 | `self-test.json` 中 `detail.verdict` 同时出现 `violated` 与 `survived` | 待验收（需构造可靠工具样本） |
+| A9 | 双证据方向区分 | `self-test.json` 中 canonical `detail.verdict` 同时出现 `violated` 与 `survived`（tool-failure-rate 侧 survived、probe-before-action 侧 violated） | ✓ 已实测 |
+| A10 | **假设极性生效**：`selftest_list` 对每条假设给出方向判定，并标出「状态=confirmed 但方向=反对/混杂」的存量误判 | 修复前 `polaritySuspects=7`（6 反对 + 1 混杂，逐条 id 见 §9 记录）；7 条处置后归零 | ✓ 已实测 |
+| A11 | **裁决护栏 + 返回值无损**：方向相悖时 `selftest_review` 返回 `polarityWarning`（不阻断）；可选键**不存在**而非 `undefined` | 线上两次 refine 返回 `裁决完成：…（证据 0 条；方向 mixed）`，无 `invalid output: value is not lossless JSON` | ✓ 已实测 |
+| A12 | 五族探针载荷契约统一（`verdict` 字段 + 词表 `violated`/`survived`） | `node --test "tests/*.test.mjs"` → `# tests 68 / # pass 68 / # fail 0`（含 `tests/polarity.test.mjs` 的「载荷契约」两例） | ✓ 已实测 |
 
 ## 8 · 与实现的关系
 
@@ -166,6 +169,7 @@ selftest_review(confirm, ruleDraft) → wireRuleToAgents → AGENTS.md marker �
   2. `evidence` 数组**无上限**（`addEvidence` 只 push）——长期运行的假设会无限增长（当前 16 条假设文件 41.5KB，尚可）。
   3. 通知失败不重试（§5 失败面）。
   4. `read-repeat` 的 `readTimes` 只留最近 20 次且**仅内存**：重启即失忆。
+  5. **`plan-before-action` 没有对照组**（2026-09-17 补记，见 U6）：它只记录「无规划 + ≥1 失败」这一个象限，合规突发不产证据 ⇒ 条件型主张（「不规划 ⇒ 更易失败」）在结构上**不可判**。未补对照组前，该类假设不得 confirm。
 - **生效判据**（改了代码后怎么证明真的生效）：
   1. **产物 vs 进程**：`lib/index.js` mtime 早于 web 进程启动时间（当前 09-12 22:03:23 < 09-14 10:05:47 ✓ live）。**改了探针代码必须重建 + 重启**才生效。
   2. **落盘物证**：`$DSH_HOME/agent-self-test/self-test.json` 的 mtime 前进（每次采证/裁决都写）；`backups/` 出现新 `.bak-*`（布线）。
@@ -190,6 +194,19 @@ selftest_review(confirm, ruleDraft) → wireRuleToAgents → AGENTS.md marker �
 - 语义**被修正**：无（未发现实现与文档冲突；README 的探针表已与实现一致）。
 - 教训（同时回写技能 `semantic-doc-first`）：**「传感器失明」是一种必须写进文档的失效模式**——机制「在运行」不等于「能采到证」；语义文档的 §5 失败面必须显式写出每个探针**偏好哪一侧误判**（本插件四个探针的偏好各不相同，只有源码注释里有）。
 
+**2026-09-17 实践回修：探针极性缺失（任务 `t-56b052fb`）**
+
+- 语义**被修正**（文档与实现都缺的那一层）：
+  - 本文原先把「证据方向」只当作**探针的属性**（`detail.verdict`），**漏掉了假设属性 `polarity`**——同一份 `violated` 证据对「我会做 X」是**反对**、对「我倾向做 X」（自省缺陷型）是**支持**。新增 `src/polarity.ts` 作为唯一真源（`DEFAULT_POLARITY` / `LEGACY_UNLABELED_VERDICT` / `readEventVerdict` / `resolvePolarity` / `computeDirection` / `contradictsDirection`），`ProbeKind` 定义也移入该模块（§5.22 判据单一真源）。
+  - 五族探针载荷统一为 canonical `detail.verdict`：`probe-before-action` 由 `kind:'violation'` 改名（旧字段名与旧词形 `violation` 由 `readEventVerdict` 兼容读取）；`read-repeat` / `plan-before-action` 由**完全不写**改为显式 `verdict:'violated'`。
+  - 四个消费方（`notifyFinding` / `selftest_findings` / `selftest_list` / `selftest_review`）改为共用 `computeDirection`；`selftest_list` 新增**存量极性体检**（`polaritySuspects` = confirmed 但方向为反对/混杂），取代一次性排障脚本（§5.22 规则 6：排障即升级工具）。
+  - `selftest_add` 新增 `polarity` 参数并在写入时**物化默认值**；`selftest_review` 新增 `polarity` 参数（refine 时校正极性）。
+- 语义**被确认**：五环第三环「finding」的正确读法是「**证据够了**」而不是「假设被证实」——原 `selftest_findings` 描述与通知文案都写成后者，实测导致 7 条「我会先做 X」型假设方向读反（6 条被违规证据判成 confirmed + 1 条混杂）。
+- 实测处置（一次性裁决留痕）：`h-mtfgltcj-2` / `h-mtfj0qnc-1` / `h-mtisdxq1-1` / `h-mtzit9kb-1` / `h-mu0kkke2-1` / `h-mu1atc6v-1` → **refute**（前两条是条件型主张、无对照组不可判；中间三条是「我会先探测」被违规证据证伪；末条是「序位判据」行为主张被证伪——**规则保留、行为主张淘汰**）；`h-mu0qvlm1-2` / `h-mu3rd53i-1` → **refine**（去掉不可证伪措辞、加量化判据、清旧证据重采）；重开一条声明极性的新假设 `h-mu4djfqf-1`。
+- 事故与教训（同时回写技能 `dsh-plugin-pitfalls`）：
+  1. **「方向住在人脑子里」是一种静默失真**：三族探针不写方向字段，方向靠「这类探针只在违规时发射」的隐式约定 ⇒ 任何消费方都得自己猜，猜错就把「被证伪」读成「被证实」（本条已证）。
+  2. **可选键绝不可写成 `x ?? undefined`**：`JSON.parse(JSON.stringify(v))` 会丢掉该键 ⇒ 与原值不等 ⇒ 宿主判 `invalid output: value is not lossless JSON`。要点：**execute 的副作用已落盘，只是返回值被拒**（本次 6 条裁决靠这一事实落地，靠事后 `selftest_list` 复核确认，而非假定）。
+
 ## 10 · 未决问题
 
 - **U1 探针工具清单的自维护**：`PROBE_TOOLS`/`MUTATING_TOOLS` 靠手维护（新增工具后不会自动归类）。倾向：加一条 `claim-vs-evidence` 式元假设——「未分类的工具占比 > X%」即提示清单腐化。
@@ -197,3 +214,4 @@ selftest_review(confirm, ruleDraft) → wireRuleToAgents → AGENTS.md marker �
 - **U3 evidence 数组无上限**：倾向保留最近 N 条 + 计数（裁决只需条数与方向，不需全部明细）。
 - **U4 finding 通知失败无重试**：是否改为「落盘待通知队列 + 启动补发」（与 telegram outbox 同款）？
 - **U5 `workspaceDir` 缺省 `process.cwd()`**：web 进程 cwd 是工作区，但 watch/sentinel 类场景下 cwd 可能不同——是否需要像其他插件一样显式配置？
+- **U6 `plan-before-action` 缺对照组**（2026-09-17 新增）：本族只有违规路径 ⇒ 条件型/相关型主张结构上不可判（实测已有 2 条假设因此被证伪）。倾向：给 `src/burst.ts` 补 survived 路径（合规突发且零失败 ⇒ 记 `verdict:'survived'`，同 `probe.ts` 2026-09-17 所做），补齐后重开该类检验。

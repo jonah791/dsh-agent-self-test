@@ -24,6 +24,14 @@ export interface BurstEvidence {
   calls: number
   failures: number
   hadPlan: boolean
+  /**
+   * 探针层事件方向（canonical 字段名 = `verdict`，2026-09-17 补，任务 t-56b052fb）：
+   * 本族当前**只有违规路径**（突发无规划 + ≥1 失败）⇒ 恒为 `violated`。
+   * 显式写出来的意义：消费方不必再靠「这类探针只在违规时发射」的隐式约定猜方向。
+   * ⚠ 缺口如实记账：合规路径（有规划且未撞墙）目前**不产证据** ⇒「我会先规划」类假设
+   *   在本探针上仍不可确认（与 t-b2c2d903 给 probe-before-action 补 survived 前同款）。
+   */
+  verdict: 'violated'
 }
 
 export interface BurstOptions {
@@ -71,6 +79,7 @@ export function createBurstTracker(): BurstTracker {
           calls: tracker.currentBurst!.calls,
           failures: tracker.currentBurst!.failures,
           hadPlan: false,
+          verdict: 'violated',
         }
         tracker.currentBurst!.evidenced = true
       }
