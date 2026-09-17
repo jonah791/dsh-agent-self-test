@@ -28,6 +28,7 @@ import type { ProbeFirstEvidence } from './probe.ts'
 import { CLAIM_DEFAULTS, countLifeCycleClaims, decideClaimEvidence } from './claim-evidence.ts'
 import { computeDirection, resolvePolarity, contradictsDirection } from './polarity.ts'
 import type { DirectionReport, Polarity, ProbeKind } from './polarity.ts'
+import { checkBudget, extractBlockInner, spliceBlock, upsertRuleBlock } from './wiring.ts'
 
 export const name = 'agent-self-test'
 export const inject = ['tools', 'agents'] as const
@@ -45,6 +46,11 @@ export interface Config {
   notifyOnFinding: boolean
   /** 工作区根（AGENTS.md 所在；confirm 自动布线写入目标）。缺省 process.cwd()。 */
   workspaceDir?: string
+  /**
+   * AGENTS.md 写入字节预算（默认 65000；注入硬上限实测 ~65536，超限从**尾部静默截断**）。
+   * 布线前先做预算裁决，超限**拒写并回报**——治未乱（§5.10），而不是等尾部规则被吃掉。
+   */
+  agentsMaxBytes: number
 }
 
 export const Config = z.object({
@@ -54,6 +60,7 @@ export const Config = z.object({
   mainSessionOnly: z.boolean().default(true),
   notifyOnFinding: z.boolean().default(true),
   workspaceDir: z.string().required(false),
+  agentsMaxBytes: z.number().default(65000),
 })
 
 /** 探针类型（单一真源 = polarity.ts —— 禁止两份定义各自漂移，§5.22 判据单一真源） */
@@ -222,17 +229,42 @@ export function apply(ctx: Context, config: Config): void {
   const workspaceRoot = config.workspaceDir || process.cwd()
   const agentsFile = join(workspaceRoot, 'AGENTS.md')
 
-  /** 自动布线（2026-09-06 审查改进：五环「布线」环节自动化，不再靠临场自觉）：
-   *  confirm 带 ruleDraft 时写入 AGENTS.md——marker 块包裹（已有块则整体替换，无则文件末尾追加）；
-   *  写前先备份原文件到 <DSH_HOME>/agent-self-test/AGENTS.md.bak-<ts>（回滚安全网）；原子写（tmp+rename）。
-   *  返回 { wired, file, error? }。 */
-  const wireRuleToAgents = (ruleDraft: string): { wired: boolean; file: string; error?: string } => {
-    const markerStart = '<!-- dsh-agent-self-test:start -->'
-    const markerEnd = '<!-- dsh-agent-self-test:end -->'
-    const block = markerStart + '\n' + ruleDraft.trim() + '\n' + markerEnd
+  /**
+   * 自动布线（2026-09-06 引入五环自动化；**2026-09-17 改为 upsert + 预算守卫**）。
+   *
+   * 旧实现（构成两次事故）：`full.replace(/start[\s\S]*end/, block)` = **整块替换**——
+   * 隐含假设「块里只有一条规则」，而块是累积的 ⇒ 第二次 confirm 抹掉第一次的规则，
+   * 且只有**字节数反降**才暴露（65,151 → 64,795；2026-09-16 与 09-17 各一次）。
+   * 新语义：**合并**（同规则幂等跳过 / 新规则追加在块尾 / 既有条目一字不动）
+   * + 写入前**字节预算裁决**（超限拒写并回报，绝不静默截断尾部）。备份与原子写保持原样。
+   * @returns action：`added`（已新增）/ `exists`（幂等跳过）/ `rejected`（超预算拒写）/ `error`
+   */
+  const wireRuleToAgents = (
+    ruleDraft: string,
+  ): { wired: boolean; action: 'added' | 'exists' | 'rejected' | 'error'; file: string; bytes?: number; headroom?: number; error?: string } => {
     try {
-      if (!existsSync(agentsFile)) return { wired: false, file: agentsFile, error: 'AGENTS.md 不存在: ' + agentsFile }
+      if (!existsSync(agentsFile)) {
+        return { wired: false, action: 'error', file: agentsFile, error: 'AGENTS.md 不存在: ' + agentsFile }
+      }
       const full = readFileSync(agentsFile, 'utf8')
+      const merged = upsertRuleBlock(extractBlockInner(full) ?? '', ruleDraft)
+      if (merged.action === 'exists') {
+        // 幂等：同一条规则已在块内 ⇒ 一字不写（这也让「重复 confirm」变得无害）
+        return { wired: false, action: 'exists', file: agentsFile }
+      }
+      const next = spliceBlock(full, merged.inner)
+      const budget = checkBudget(next, config.agentsMaxBytes)
+      if (!budget.allowed) {
+        return {
+          wired: false,
+          action: 'rejected',
+          file: agentsFile,
+          bytes: budget.bytes,
+          headroom: budget.headroom,
+          error: '写入后 ' + String(budget.bytes) + ' 字节 > 预算 ' + String(config.agentsMaxBytes)
+            + '（注入硬上限实测 ~65536，超限从尾部静默截断）——先腾空间（把旧版史迁 docs/rulebook.md 后删）再布线',
+        }
+      }
       // 备份（best-effort：备份失败不阻断布线——checkpoint 是主安全网）
       try {
         const bakDir = join(dirname(statePath), 'backups')
@@ -240,15 +272,12 @@ export function apply(ctx: Context, config: Config): void {
         const bak = join(bakDir, 'AGENTS.md.bak-' + new Date().toISOString().replace(/[:.]/g, '-'))
         writeFileSync(bak, full, 'utf8')
       } catch { /* 备份失败忽略 */ }
-      const next = full.includes(markerStart)
-        ? full.replace(new RegExp('<!-- dsh-agent-self-test:start -->[\\s\\S]*<!-- dsh-agent-self-test:end -->'), block)
-        : full.replace(/\n?\s*$/, '\n') + '\n' + block + '\n'
       const tmp = agentsFile + '.tmp'
       writeFileSync(tmp, next, 'utf8')
       renameSync(tmp, agentsFile)
-      return { wired: true, file: agentsFile }
+      return { wired: true, action: 'added', file: agentsFile, bytes: budget.bytes, headroom: budget.headroom }
     } catch (err) {
-      return { wired: false, file: agentsFile, error: String(err) }
+      return { wired: false, action: 'error', file: agentsFile, error: String(err) }
     }
   }
 
@@ -645,7 +674,15 @@ export function apply(ctx: Context, config: Config): void {
         type: 'text',
         text: v.ok
           ? ('裁决完成：[' + v.id + '] → ' + v.status + '（证据 ' + v.evidence + ' 条；方向 ' + String(v.direction ?? '未知') + '）'
-            + (v.wired ? ' ⚡ 已自动布线 AGENTS.md' : '')
+            + (v.wired === null || v.wired === undefined
+              ? ''
+              : v.wired.action === 'added'
+                ? ' ⚡ 已布线 AGENTS.md（新增 1 条，余量 ' + String(v.wired.headroom ?? '?') + ' 字节）'
+                : v.wired.action === 'exists'
+                  ? ' ✓ 该规则已在块内（幂等跳过，未重复写入）'
+                  : v.wired.action === 'rejected'
+                    ? ' ⚠ 未写入 AGENTS.md：' + String(v.wired.error ?? '超预算')
+                    : ' ⚠ 布线失败：' + String(v.wired.error ?? '未知原因'))
             + (v.polarityWarning ? '\n' + v.polarityWarning : ''))
           : '裁决失败：' + String(v.error ?? ''),
       }],
@@ -668,7 +705,14 @@ export function apply(ctx: Context, config: Config): void {
             : '若已确认要逆方向裁定，请在 resolution 写明理由（本次已照办）。')
       }
       if (args.polarity !== undefined) h.probe.polarity = args.polarity
-      let wired: { wired: boolean; file?: string; error?: string } | null = null
+      let wired: {
+        wired: boolean
+        action: 'added' | 'exists' | 'rejected' | 'error'
+        file: string
+        bytes?: number
+        headroom?: number
+        error?: string
+      } | null = null
       const note = (base: string): string => polarityWarning === null ? base : base + ' ｜ ' + polarityWarning
       if (args.verdict === 'confirm') {
         h.status = 'confirmed'
@@ -693,13 +737,31 @@ export function apply(ctx: Context, config: Config): void {
       // 会让 `JSON.parse(JSON.stringify(v))` 与原值不等（键被 stringify 丢掉）⇒ 宿主判
       // `invalid output: value is not lossless JSON`（**execute 的副作用已落盘，只是返回值被拒**）。
       // 正确做法：可选键**不存在**，而不是「存在但为 undefined」。
-      const out: { ok: boolean; id: string; status: string; evidence: number; direction: string; polarityWarning?: string; wired: { file: string } | null } = {
+      // 布线结果如实回报（2026-09-17）：区分 added / exists / rejected / error ——「可见面」纪律：
+      // 拒写与幂等跳过的原因必须当场可见，否则「默默没写」又是一次静默失败（对照技能 mechanism-closure）。
+      const wiredOut = wired === null
+        ? null
+        : {
+            action: wired.action,
+            file: wired.file,
+            ...(wired.action === 'added' ? { headroom: wired.headroom ?? 0 } : {}),
+            ...(wired.error !== undefined ? { error: wired.error } : {}),
+          }
+      const out: {
+        ok: boolean
+        id: string
+        status: string
+        evidence: number
+        direction: string
+        polarityWarning?: string
+        wired: { action: string; file: string; headroom?: number; error?: string } | null
+      } = {
         ok: true,
         id: h.id,
         status: h.status,
         evidence: h.evidence.length,
         direction: dir.direction,
-        wired: wired?.wired === true ? { file: wired.file ?? '' } : null,
+        wired: wiredOut,
       }
       if (polarityWarning !== null) out.polarityWarning = polarityWarning
       return out
