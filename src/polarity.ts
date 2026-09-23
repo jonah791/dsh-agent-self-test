@@ -14,6 +14,12 @@
  *   例：read-repeat 的 violated（又重复读了）对「我不该重复读」是反对，对「我倾向于重复读」是支持。
  *   同一份证据、极性不同、裁决方向相反 —— 所以极性必须显式住在数据里，不能住在人的脑子里。
  *
+ * 2026-09-20 增量（进化方向第一层「分辨力」）：`Direction` 只按「两个方向是否都非零」判定 ⇒
+ *   **7:1 与 1:1 同级**（都叫 mixed），消费方无法区分「接近成立，只差一条反例」与「真的判不了」。
+ *   实测后果：两条 7:1 / 4:1 的 confirmed 假设被标「⚠极性存疑（疑似裁决时把方向读反了）」——
+ *   而它们方向没错，是**分辨率不足**（误诊）。⇒ 新增 `Lean` 倾向度分档 + `ratio`，只加信息、不改语义
+ *   （`lean` 缺省时所有旧调用行为不变）。
+ *
  * 纯模块：无 IO、无时间依赖，便于离线单测（tests/polarity.test.mjs）。
  */
 
@@ -27,6 +33,23 @@ export type Polarity = 'violation-refutes' | 'violation-supports'
 
 /** 方向判定结果 */
 export type Direction = 'support' | 'refute' | 'mixed' | 'unknown'
+
+/**
+ * 证据倾向度（2026-09-20）：`mixed` 内部再分档。
+ * 只在 `direction === 'mixed'` 时有分辨意义；其余方向与 `direction` 同向（消费方无需特判）。
+ */
+export type Lean = 'lean-support' | 'lean-refute' | 'balanced' | 'none'
+
+/** 倾向阈值（**展示/文档用**）：支持占比 ≥ 0.8 判 lean-support，≤ 0.2 判 lean-refute，其间为 balanced */
+export const LEAN_THRESHOLD = 0.8
+
+/**
+ * 判定用的整数比（0.8 = 4/5）：**避开浮点边界** —— `1/5` 与 `1 - 0.8` 在 IEEE754 下并不相等
+ * （0.2000000000000000111 vs 0.1999999999999999556）。实测边界用例 1:4 因此被误判成 balanced，
+ * 由离线单测 `tests/polarity.test.mjs`「阈值边界」抓到 ⇒ 判定改用整数交叉相乘。
+ */
+const LEAN_NUM = 4
+const LEAN_DEN = 5
 
 /**
  * 各探针的默认极性（缺省 = 该族假设的常见主张形态）：
@@ -78,6 +101,10 @@ export function resolvePolarity(probe: { kind: ProbeKind; polarity?: Polarity } 
 
 export interface DirectionReport {
   direction: Direction
+  /** 倾向度分档（2026-09-20）：mixed 内部再分档，供体检/护栏区分「接近成立」与「真判不了」 */
+  lean: Lean
+  /** 支持占比 support/(support+refute)；无方向证据时为 0（诚实留白，不猜） */
+  ratio: number
   /** 支持假设的证据条数 */
   support: number
   /** 反对假设的证据条数 */
@@ -128,16 +155,46 @@ export function computeDirection(
     else refute += 1
   }
   const direction: Direction = support > 0 && refute > 0 ? 'mixed' : support > 0 ? 'support' : refute > 0 ? 'refute' : 'unknown'
-  const headline = direction === 'support' ? '假设成立' : direction === 'refute' ? '假设不成立' : direction === 'mixed' ? '方向混杂' : '未知'
+  // 倾向度（2026-09-20）：mixed 内部再分档 —— 让 7:1 不再与 1:1 同级
+  const directional = support + refute
+  const ratio = directional > 0 ? support / directional : 0
+  // 判定用**整数交叉相乘**（见 LEAN_NUM/LEAN_DEN 注释）：浮点比较在边界上会误判
+  const lean: Lean = directional === 0
+    ? 'none'
+    : support * LEAN_DEN >= directional * LEAN_NUM
+      ? 'lean-support'
+      : support * LEAN_DEN <= directional * (LEAN_DEN - LEAN_NUM)
+        ? 'lean-refute'
+        : 'balanced'
+  const leanNote = direction === 'mixed' && lean !== 'balanced'
+    ? `（倾向${lean === 'lean-support' ? '支持' : '反对'} ${support}:${refute} —— 差的是反例，不是判据）`
+    : ''
+  const headline = direction === 'support'
+    ? '假设成立'
+    : direction === 'refute'
+      ? '假设不成立'
+      : direction === 'mixed'
+        ? '方向混杂' + leanNote
+        : '未知'
   const legacyNote = legacyAssumed > 0 ? `，其中 ${legacyAssumed} 条按历史规则推定（旧数据无方向标签）` : ''
   const unknownNote = unknown > 0 ? `，${unknown} 条无方向标签` : ''
   const text = `证据指向：${headline}（支持 ${support} / 反对 ${refute}${legacyNote}${unknownNote}；极性 ${polarity}）⇒ ${SUGGEST[direction]}`
-  return { direction, support, refute, legacyAssumed, unknown, polarity, text }
+  return { direction, lean, ratio, support, refute, legacyAssumed, unknown, polarity, text }
 }
 
-/** 裁决动作与证据方向是否相悖（供 review 返响亮警告；**不阻断** —— 决策权归主体，§2.1） */
-export function contradictsDirection(action: 'confirm' | 'refute', direction: Direction): boolean {
+/**
+ * 裁决动作与证据方向是否相悖（供 review 返响亮警告；**不阻断** —— 决策权归主体，§2.1）。
+ *
+ * 2026-09-20：接受可选 `lean` —— 倾向明显时只在与**倾向相反**时算相悖。
+ * 旧行为「mixed 一律相悖」会把 7:1 也告警（等于制造噪音、把「分辨率不足」误报成「方向读反」）；
+ * `lean` 缺省时行为与旧版完全一致（向后兼容）。
+ */
+export function contradictsDirection(action: 'confirm' | 'refute', direction: Direction, lean?: Lean): boolean {
   if (direction === 'unknown') return false
-  if (direction === 'mixed') return true
+  if (direction === 'mixed') {
+    if (lean === 'lean-support') return action === 'refute'
+    if (lean === 'lean-refute') return action === 'confirm'
+    return true
+  }
   return (action === 'confirm' && direction === 'refute') || (action === 'refute' && direction === 'support')
 }

@@ -180,3 +180,81 @@ describe('载荷契约 · 五族探针的证据都必须带 canonical verdict �
     assert.equal(readEventVerdict(ev), 'violated')
   })
 })
+
+describe('倾向度分档 · lean/ratio（2026-09-20 增量：让 7:1 不再与 1:1 同级）', () => {
+  const E = (verdict) => [{ detail: { verdict } }]
+  const mix = (yes, no) => [
+    ...Array.from({ length: yes }, () => ({ detail: { verdict: 'survived' } })),
+    ...Array.from({ length: no }, () => ({ detail: { verdict: 'violated' } })),
+  ]
+
+  test('7:1 ⇒ mixed 但 lean-support（近成立，差的是反例而非判据）', () => {
+    const r = computeDirection(mix(7, 1), { kind: 'tool-failure-rate' })
+    assert.equal(r.direction, 'mixed')
+    assert.equal(r.lean, 'lean-support')
+    assert.equal(r.ratio, 0.875)
+    assert.match(r.text, /倾向支持 7:1/)
+  })
+
+  test('1:1 ⇒ mixed 且 balanced（真判不了 —— 与 7:1 不再同级）', () => {
+    const r = computeDirection(mix(1, 1), { kind: 'tool-failure-rate' })
+    assert.equal(r.direction, 'mixed')
+    assert.equal(r.lean, 'balanced')
+    assert.equal(r.ratio, 0.5)
+  })
+
+  test('1:7 ⇒ lean-refute', () => {
+    const r = computeDirection(mix(1, 7), { kind: 'tool-failure-rate' })
+    assert.equal(r.lean, 'lean-refute')
+    assert.equal(r.ratio, 0.125)
+  })
+
+  test('阈值边界：4:1（ratio 0.8）⇒ lean-support；1:4（0.2）⇒ lean-refute', () => {
+    assert.equal(computeDirection(mix(4, 1), { kind: 'tool-failure-rate' }).lean, 'lean-support')
+    assert.equal(computeDirection(mix(1, 4), { kind: 'tool-failure-rate' }).lean, 'lean-refute')
+  })
+
+  test('无方向证据 ⇒ lean=none / ratio=0（诚实留白，不当成 balanced）', () => {
+    const r = computeDirection([], { kind: 'tool-failure-rate' })
+    assert.equal(r.lean, 'none')
+    assert.equal(r.ratio, 0)
+  })
+
+  test('纯单向 ⇒ lean 与 direction 同向', () => {
+    assert.equal(computeDirection(mix(3, 0), { kind: 'tool-failure-rate' }).lean, 'lean-support')
+    assert.equal(computeDirection(mix(0, 3), { kind: 'tool-failure-rate' }).lean, 'lean-refute')
+  })
+
+  test('护栏：lean-support 时 confirm 放行 / refute 报警（旧行为对两者都报警）', () => {
+    assert.equal(contradictsDirection('confirm', 'mixed', 'lean-support'), false)
+    assert.equal(contradictsDirection('refute', 'mixed', 'lean-support'), true)
+  })
+
+  test('护栏：lean-refute 时 refute 放行 / confirm 报警', () => {
+    assert.equal(contradictsDirection('refute', 'mixed', 'lean-refute'), false)
+    assert.equal(contradictsDirection('confirm', 'mixed', 'lean-refute'), true)
+  })
+
+  test('护栏：balanced 仍对任何单向裁决报警（真混杂不放水）', () => {
+    assert.equal(contradictsDirection('confirm', 'mixed', 'balanced'), true)
+    assert.equal(contradictsDirection('refute', 'mixed', 'balanced'), true)
+  })
+
+  test('向后兼容：不传 lean ⇒ 行为与旧版完全一致（mixed 一律报警）', () => {
+    assert.equal(contradictsDirection('confirm', 'mixed'), true)
+    assert.equal(contradictsDirection('refute', 'mixed'), true)
+  })
+
+  test('尸体测试·h-mu4djfqf-1 形（7 支持 / 1 反对的 confirmed）⇒ 不再被误报为「方向相悖」', () => {
+    const r = computeDirection(mix(7, 1), { kind: 'probe-before-action', polarity: 'violation-refutes' })
+    // 旧口径：mixed + confirmed ⇒ ⚠极性存疑（把「分辨率不足」误诊成「方向读反」）
+    assert.equal(r.lean, 'lean-support')
+    assert.equal(contradictsDirection('confirm', r.direction, r.lean), false, '倾向支持时 confirm 不该报警')
+  })
+
+  test('尸体测试·真混杂（3:2 · 本次两条 finding 的形状）⇒ balanced，仍该 refine 不放行', () => {
+    const r = computeDirection(mix(3, 2), { kind: 'probe-before-action' })
+    assert.equal(r.lean, 'balanced')
+    assert.equal(contradictsDirection('confirm', r.direction, r.lean), true, '真混杂时必须继续报警')
+  })
+})

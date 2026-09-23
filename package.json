@@ -1,7 +1,7 @@
 {
   "name": "dsh-agent-self-test",
-  "version": "0.5.1",
-  "description": "自我检验闭环插件：把「猜想→检验→学习」自指引擎做成运行时机制——可证伪自我假设库 + 工具管线自动采证（4 探针含 5.9 probe-before-action 行动前探测传感器）+ finding 浮现裁决 + **AGENTS.md 布线 upsert**（按内容合并，绝不整块替换；带字节预算守卫拒写），实现惊奇最小化的主动自我实验。",
+  "version": "0.6.0",
+  "description": "自我检验闭环插件：把「猜想→检验→学习」自指引擎做成运行时机制——可证伪自我假设库 + 工具管线自动采证（4 探针含 5.9 probe-before-action 行动前探测传感器）+ finding 浮现裁决 + **AGENTS.md 布线 upsert**（按内容合并，绝不整块替换；带字节预算守卫拒写）。v0.6.0（2026-09-20）：方向判定新增**倾向度分档**（lean/ratio，判定走整数交叉相乘避开浮点边界）——让 7:1 不再与 1:1 同级，并修正体检把「证据混杂」误报成「方向读反」的误导；contradictsDirection 接受可选 lean（缺省行为不变）。",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",

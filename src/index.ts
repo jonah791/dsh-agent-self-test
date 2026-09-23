@@ -29,6 +29,13 @@ import { CLAIM_DEFAULTS, countLifeCycleClaims, decideClaimEvidence } from './cla
 import { computeDirection, resolvePolarity, contradictsDirection } from './polarity.ts'
 import type { DirectionReport, Polarity, ProbeKind } from './polarity.ts'
 import { checkBudget, extractBlockInner, spliceBlock, upsertRuleBlock } from './wiring.ts'
+import { detectCluster } from './cluster.ts'
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'dsh-agent-self-test': { kind: 'dsh-agent-self-test' }
+  }
+}
 
 export const name = 'agent-self-test'
 export const inject = ['tools', 'agents'] as const
@@ -326,7 +333,7 @@ export function apply(ctx: Context, config: Config): void {
       '——该裁决了：selftest_review（confirm 布线 / refute 淘汰 / refine 细化）。'
     // Branded MessageId 跨包版本冲突（harness packages/llm vs 插件 node_modules dsh-llm）无法在类型层调和，
     // 与 emotion 插件同款宽松绕过；运行时行为正确
-    const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'plugin', plugin: 'dsh-agent-self-test' } }) as any
+    const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'dsh-agent-self-test' } }) as any
     // reenter 修复（pitfall 2）：事件回调内同步 send 会触发 session.append reenter，延迟到事务完成后投递
     setImmediate(() => {
       try {
@@ -510,10 +517,18 @@ export function apply(ctx: Context, config: Config): void {
           id: { type: 'string' },
           status: { type: 'string' },
           threshold: { type: 'number' },
+          /** 收敛提示（第 2 层，2026-09-20）：同族已有 ≥3 条终态假设时给出 —— 只送达信号，不阻断（§2.4） */
+          clusterNote: { type: 'string' },
           error: { type: 'string' },
         },
       },
-      render: (_a: unknown, v: any) => [{ type: 'text', text: v.ok ? '已添加自我假设 [' + v.id + ']（' + v.status + '，阈值 ' + v.threshold + '）——插件开始被动采证。' : '添加失败：' + String(v.error ?? '') }],
+      render: (_a: unknown, v: any) => [{
+        type: 'text',
+        text: v.ok
+          ? '已添加自我假设 [' + v.id + ']（' + v.status + '，阈值 ' + v.threshold + '）——插件开始被动采证。'
+            + (typeof v.clusterNote === 'string' && v.clusterNote.length > 0 ? String.fromCharCode(10) + v.clusterNote : '')
+          : '添加失败：' + String(v.error ?? ''),
+      }],
     },
     async execute(args: { statement: string; prediction: string; kind: ProbeKind; polarity?: Polarity; tool?: string; failureRateAbove?: number; minSamples?: number; windowMs?: number; repeatCount?: number; minSteps?: number; burstGapMs?: number; planWindowMs?: number; minActions?: number; probeWindowMs?: number; claimWindowMs?: number; minArranged?: number; claimCheckIntervalMs?: number; threshold?: number; source?: string }) {
       const state = loadState(statePath)
@@ -546,15 +561,19 @@ export function apply(ctx: Context, config: Config): void {
         updatedAt: nowIso(),
         source: args.source ?? 'alice',
       }
+      // 收敛治理（第 2 层，2026-09-20）：新建**之前**先看同族是否已成堆 —— 只在建前提示，
+      // 逼出显式选择（refine 旧判据 / 承认不可测 / 转机制承载）。治的是「同题反复重开」，不是「被证伪」。
+      // ⚠ 必须在 push 之前算：否则会把刚建的这条也算进簇里。
+      const clusterNote = detectCluster(state.hypotheses, args.kind).text
       state.hypotheses.push(h)
       saveState(statePath, state)
-      return { ok: true, id: h.id, status: h.status, threshold }
+      return { ok: true, id: h.id, status: h.status, threshold, clusterNote }
     },
   }))
 
   ctx.tools.register(defineTool({
     name: 'selftest_list',
-    description: '列出自我假设库：每个假设的陈述/预测/探针/极性/证据方向/证据数/状态，并顺带做存量极性体检。可过滤状态（active/finding/confirmed/refuted）。方向由 polarity.ts 统一判定（支持/反对/混杂/未知）——confirmed 却「证据指向不成立」的行会标 ⚠极性存疑（裁决时方向读反了，该重新裁定）。',
+    description: '列出自我假设库：每个假设的陈述/预测/探针/极性/证据方向/证据数/状态，并顺带做存量极性体检。可过滤状态（active/finding/confirmed/refuted）。方向由 polarity.ts 统一判定（支持/反对/混杂/未知）+ 倾向度分档——confirmed 但方向**非纯支持**的行会标 ⚠极性存疑（⚠ 成因多数是**证据混杂**（正反都有），不是「方向读反」；2026-09-20 起「混杂但倾向支持」不再计入）。',
     parameters: {
       status: { type: 'string', enum: ['active', 'finding', 'confirmed', 'refuted', 'archived'], description: '状态过滤' },
     },
@@ -565,7 +584,7 @@ export function apply(ctx: Context, config: Config): void {
         properties: {
           ok: { type: 'boolean', required: true },
           total: { type: 'number' },
-          /** 存量极性体检结论：状态=confirmed 但证据方向为「反对」或「混杂」的条数（>0 ⇒ 待复核） */
+          /** 存量极性体检结论：状态=confirmed 且证据方向非纯支持（且非「倾向支持」）的条数（>0 ⇒ 待复核） */
           polaritySuspects: { type: 'number' },
           hypotheses: { type: 'json' },
         },
@@ -578,12 +597,16 @@ export function apply(ctx: Context, config: Config): void {
         const lines = hs.map((h: any) => {
           const statusMark = h.status === 'finding' ? '⚠FINDING' : h.status === 'confirmed' ? '✓' : h.status === 'refuted' ? '✗' : '·'
           const dir = h.direction ?? {}
-          const dirMark = dir.direction === 'support' ? '支持' : dir.direction === 'refute' ? '反对' : dir.direction === 'mixed' ? '混杂' : '未知'
-          const suspect = h.polaritySuspect === true ? ' ⚠极性存疑（状态与证据方向相悖）' : ''
+          // 倾向度（2026-09-20）：混杂时把比例显出来 —— 7:1 与 1:1 不再长得一样
+          const leanNote = dir.direction === 'mixed'
+            ? (dir.lean === 'lean-support' ? `·倾向支持 ${dir.support}:${dir.refute}` : dir.lean === 'lean-refute' ? `·倾向反对 ${dir.support}:${dir.refute}` : `·均势 ${dir.support}:${dir.refute}`)
+            : ''
+          const dirMark = dir.direction === 'support' ? '支持' : dir.direction === 'refute' ? '反对' : dir.direction === 'mixed' ? '混杂' + leanNote : '未知'
+          const suspect = h.polaritySuspect === true ? ' ⚠极性存疑（状态与证据方向不相符）' : ''
           return `${statusMark} [${h.id}] ${h.statement}\n   预测: ${h.prediction}\n   探针: ${h.probe?.kind ?? '?'}（极性 ${h.probe?.polarity ?? '默认'}） | 证据 ${h.evidence?.length ?? 0}/${h.threshold} | 方向 ${dirMark}（支持 ${dir.support ?? 0}/反对 ${dir.refute ?? 0}${dir.legacyAssumed > 0 ? `/推定 ${dir.legacyAssumed}` : ''}） | ${h.status}${suspect}`
         })
         const head = v.polaritySuspects > 0
-          ? `⚠ 极性存疑 ${v.polaritySuspects} 条——状态与证据方向相悖，疑似裁决时把方向读反了 ⇒ 逐条处置：refine（重建断言、清旧证据重新采证）或 refute（淘汰）。\n`
+          ? `⚠ 极性存疑 ${v.polaritySuspects} 条——状态标「成立」但证据方向非纯支持。**成因不只一种**：多数是证据混杂（正反都有），少数才是极性标错或方向读反 ⇒ 逐条看方向与倾向再处置（refine 细化判据 / refute 淘汰 / 保持）。\n`
           : ''
         return [{ type: 'text', text: head + `自我假设库（${hs.length}）\n` + lines.join('\n') }]
       },
@@ -594,9 +617,14 @@ export function apply(ctx: Context, config: Config): void {
       if (args.status !== undefined) hs = hs.filter((h) => h.status === args.status)
       const enriched = hs.map((h) => {
         const direction: DirectionReport = computeDirection(h.evidence, h.probe)
-        // 存量极性体检（2026-09-17）：状态说「成立」而证据方向是「反对」或「混杂」= 待复核指纹。
-        // 只算 refute 会漏掉「confirmed 但证据两个方向都有」这一类（实测 h-mu0qvlm1-2 就是漏网的）。
-        const polaritySuspect = h.status === 'confirmed' && direction.direction !== 'support'
+        // 存量极性体检（2026-09-17；2026-09-20 细化）：
+        // 状态说「成立」而证据方向**非纯支持** ⇒ 待复核指纹（只算 refute 会漏掉「正反都有」那一类）。
+        // 2026-09-20 增量：方向为 mixed 但**倾向支持**（如 7:1）不再计入 —— 那类不是「方向相悖」，
+        // 而是「还差一条反例」；把它标成 ⚠ 等于把「分辨率不足」误诊为「方向读反」（实测两条被误报）。
+        const polaritySuspect =
+          h.status === 'confirmed' &&
+          direction.direction !== 'support' &&
+          direction.lean !== 'lean-support'
         return { ...h, direction, polaritySuspect }
       })
       return {
@@ -698,7 +726,7 @@ export function apply(ctx: Context, config: Config): void {
       // 方向判定（2026-09-17）：裁决前先看清证据指向什么，与动作相悖就响亮提示（不阻断）
       const dir = computeDirection(h.evidence, h.probe)
       let polarityWarning: string | null = null
-      if (args.verdict !== 'refine' && contradictsDirection(args.verdict, dir.direction)) {
+      if (args.verdict !== 'refine' && contradictsDirection(args.verdict, dir.direction, dir.lean)) {
         polarityWarning = `⚠ 护栏提示：${dir.text} —— 而你选择了 ${args.verdict}。`
           + (dir.direction === 'refute'
             ? '若主张本就该被证伪（「我不会 X」型），正确动作通常是 refute 或 refine（改写断言后重新采证）。'
