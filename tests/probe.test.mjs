@@ -31,7 +31,7 @@ describe('classifyTool · 工具角色分类', () => {
     assert.equal(classifyTool('read', { file_path: 'E:\\alice\\TOOLS.md' }), 'probe')
     assert.equal(classifyTool('read', { file_path: '/mnt/e/alice/projects/self/TOOLS.md' }), 'probe')
     assert.equal(classifyTool('glob', { pattern: '**/*.ts', path: 'E:\\alice\\self-plugins' }), 'probe')
-    assert.equal(classifyTool('read', { file_path: '/mnt/c/Users/tr/.agents/skills/x/SKILL.md' }), 'probe')
+    assert.equal(classifyTool('read', { file_path: '/mnt/c/Users/demo/.agents/skills/x/SKILL.md' }), 'probe')
     // 不命中：普通脚本 / 产物目录 / 相似但不同的文件名 / 无路径
     assert.equal(classifyTool('read', { file_path: 'E:\\alice\\_tmp_scripts\\rehost.sh' }), 'neutral')
     assert.equal(classifyTool('glob', { pattern: '*.md', path: 'E:\\alice\\_tmp_review' }), 'neutral')
